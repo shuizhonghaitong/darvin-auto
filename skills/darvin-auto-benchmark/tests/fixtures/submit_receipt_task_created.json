@@ -1,0 +1,62 @@
+{
+  "command": "solution submit",
+  "schema_version": "1",
+  "status": "warning",
+  "sections": [
+    {
+      "title": "Submission",
+      "fields": [
+        {
+          "name": "stage",
+          "value": "task_created"
+        },
+        {
+          "name": "model_saved",
+          "value": "true"
+        },
+        {
+          "name": "task_created",
+          "value": "true"
+        },
+        {
+          "name": "job_created",
+          "value": "true"
+        },
+        {
+          "name": "model_app_id",
+          "value": "130"
+        },
+        {
+          "name": "submission_id",
+          "value": "60"
+        },
+        {
+          "name": "task_id",
+          "value": "T-NEW"
+        },
+        {
+          "name": "trace_id",
+          "value": "v1:cafe"
+        },
+        {
+          "name": "historical",
+          "value": "false"
+        }
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "receipt_path",
+      "path": "~/.darvin-cli/receipts/v1:abc.json"
+    },
+    {
+      "name": "profile",
+      "value": "prod"
+    }
+  ],
+  "warnings": [
+    "Returned historical receipt; this is not current execution status."
+  ],
+  "errors": []
+}

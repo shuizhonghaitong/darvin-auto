@@ -1,0 +1,27 @@
+{
+  "command": "solution list",
+  "schema_version": "1",
+  "status": "success",
+  "sections": [],
+  "tables": [
+    {
+      "title": "My solutions",
+      "columns": [
+        "Model ID",
+        "Submission ID",
+        "Name",
+        "Subnet",
+        "Status",
+        "Evaluation",
+        "Score",
+        "Raw score",
+        "Task ID",
+        "Local receipt"
+      ],
+      "rows": []
+    }
+  ],
+  "artifacts": [],
+  "warnings": [],
+  "errors": []
+}

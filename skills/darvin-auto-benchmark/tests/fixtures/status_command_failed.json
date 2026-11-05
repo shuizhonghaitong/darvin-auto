@@ -1,0 +1,20 @@
+{
+  "command": "solution status",
+  "schema_version": "1",
+  "status": "failed",
+  "error_code": "NETWORK_ERROR",
+  "steps": [
+    {
+      "name": "query backend task status",
+      "status": "failed",
+      "detail": "Network error"
+    }
+  ],
+  "sections": [],
+  "tables": [],
+  "artifacts": [],
+  "warnings": [],
+  "errors": [
+    "[Errno 1] Operation not permitted"
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "command": "solution status",
+  "schema_version": "1",
+  "status": "success",
+  "sections": [
+    {
+      "title": "Task",
+      "fields": [
+        {
+          "name": "task_id",
+          "value": "T-MIX"
+        },
+        {
+          "name": "task_name",
+          "value": "x"
+        },
+        {
+          "name": "subnet_id",
+          "value": "0xabc"
+        },
+        {
+          "name": "status",
+          "value": "mixed"
+        },
+        {
+          "name": "raw_status",
+          "value": "mixed"
+        },
+        {
+          "name": "can_cancel",
+          "value": "false"
+        },
+        {
+          "name": "model_app_id",
+          "value": "127"
+        }
+      ]
+    }
+  ],
+  "tables": [],
+  "artifacts": [],
+  "warnings": [],
+  "errors": []
+}

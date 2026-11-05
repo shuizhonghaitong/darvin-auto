@@ -1,0 +1,40 @@
+{
+  "command": "solution list",
+  "schema_version": "1",
+  "status": "success",
+  "sections": [],
+  "tables": [
+    {
+      "title": "My solutions",
+      "columns": [
+        "Model ID",
+        "Submission ID",
+        "Name",
+        "Subnet",
+        "Status",
+        "Evaluation",
+        "Score",
+        "Raw score",
+        "Task ID",
+        "Local receipt"
+      ],
+      "rows": [
+        [
+          "999",
+          "88",
+          "image-auth",
+          "图像真伪",
+          "SUCCEEDED",
+          "DONE",
+          "90",
+          "9000",
+          "T-OTHERS",
+          "no"
+        ]
+      ]
+    }
+  ],
+  "artifacts": [],
+  "warnings": [],
+  "errors": []
+}

@@ -1,0 +1,94 @@
+{
+  "command": "solution status",
+  "schema_version": "1",
+  "status": "success",
+  "steps": [
+    {
+      "name": "query backend task status",
+      "status": "success",
+      "detail": "Fetched task 'T-SUCC' and 1 job(s)."
+    },
+    {
+      "name": "map task status",
+      "status": "success",
+      "detail": "Mapped 'success' to 'success'."
+    },
+    {
+      "name": "render task summary",
+      "status": "success",
+      "detail": "Rendered"
+    }
+  ],
+  "sections": [
+    {
+      "title": "Task",
+      "fields": [
+        {
+          "name": "task_id",
+          "value": "T-SUCC"
+        },
+        {
+          "name": "task_name",
+          "value": "image-auth"
+        },
+        {
+          "name": "subnet_id",
+          "value": "0xabc"
+        },
+        {
+          "name": "status",
+          "value": "success"
+        },
+        {
+          "name": "raw_status",
+          "value": "success"
+        },
+        {
+          "name": "can_cancel",
+          "value": "false"
+        },
+        {
+          "name": "model_app_id",
+          "value": "123"
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "title": "Jobs",
+      "columns": [
+        "Job ID",
+        "Stage",
+        "Status",
+        "Score (raw)",
+        "Logs",
+        "Error",
+        "Dataset Group"
+      ],
+      "rows": [
+        [
+          "J1",
+          "eval",
+          "SUCCEEDED",
+          "95 (raw 9500)",
+          "available",
+          "-",
+          "g1"
+        ]
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "profile",
+      "value": "prod"
+    },
+    {
+      "name": "base_url",
+      "value": "https://example.invalid"
+    }
+  ],
+  "warnings": [],
+  "errors": []
+}
