@@ -1,0 +1,8 @@
+# Darwin subnet 244 ASR, Jetson JP6.1
+# Derived from the verified official arm64 perception runtime.
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.261030.129c70c-jetson-jp6.1
+WORKDIR /work
+COPY perception/main.py /work/main.py
+ENV MCP_PORT=80 \
+    WS_PORT=15721 \
+    ASR_PLUGIN=asr
