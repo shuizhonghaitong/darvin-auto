@@ -1,0 +1,31 @@
+# Darwin subnet 312 (具身智能-asr基础能力-不限音色多语种榜v2 jp5,6), Jetson JP5 (JP_VERSION=5)
+# Thin overlay on the verified official arm64 perception runtime, following the
+# officially documented base tag pattern (perception/README.md,
+# deploy/build_perception.sh: perception:<tag>-jetson-jp5.11).
+# The platform wrapper launches ./start.sh from /work (WORKDIR below).
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.261030.129c70c-jetson-jp5.11
+
+WORKDIR /work
+
+# Reference ASR plugin (perception/plugins/asr.py) and full perception tree,
+# with the competition-mandated MCP_PORT/WS_PORT env-port change in main.py.
+COPY perception/ /work/perception/
+COPY start.sh /work/start.sh
+RUN chmod +x /work/start.sh
+
+# JP_VERSION 5 (JetPack 5.11, focal base): the apt python3-yaml package ships
+# only egg-info metadata, which pip cannot uninstall ("Cannot uninstall
+# 'PyYAML' ... distutils installed project"). Per the official
+# perception/Dockerfile.jetson docs, install PyYAML on its own with
+# --ignore-installed (a per-invocation flag) before any other pip step.
+RUN pip3 install --no-cache-dir --ignore-installed PyYAML
+
+ENV MCP_PORT=80 \
+    WS_PORT=15721 \
+    ASR_PLUGIN=asr \
+    JP_VERSION=5
+
+EXPOSE 80
+EXPOSE 15721
+
+CMD ["/work/start.sh"]
