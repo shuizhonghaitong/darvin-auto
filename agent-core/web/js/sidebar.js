@@ -1,0 +1,1550 @@
+/**
+ * sidebar.js — Left sidebar: driver/perception sections with tool cards.
+ * Cards show tool name, description, type badge, and detail button.
+ * Tools with configSchema show config status and config button.
+ */
+
+import { isProjectRunning, addCardFromSidebar, ensureEdit, cardsForTool } from './canvas.js';
+import { isMobile, closeSidebarMobile } from './mobile.js';
+import { makeQrField, isDisplayOnly } from './qr-field.js';
+import { openDeployPanel } from './deploy-panel.js';
+
+/**
+ * 分区图标。
+ *
+ * 原来这四层用的是 ◆ ◈ ❋ 这类几何字符 —— 它们的形状、粗细、基线全由字体决定，
+ * 和顶栏那套 24×24、stroke 1.8、round cap 的图标不是一回事，挤在 10px 标签旁边
+ * 尤其显得廉价。这里改成同一族的描边图标，各自画的是这一层真正在做的事：
+ *
+ *   agentcore  芯片 —— 做决定的那颗核
+ *   perception 眼睛 —— 这一层负责"接收"
+ *   actucore   闪电 —— 这一层负责"动"
+ *   modelhub   立方体 —— 本机跑的大模型（LLM/VLM），给决策核心提供推理
+ *   driver     插头 —— 通往某台具体硬件的那根线
+ *
+ * driver 的颜色继续表示在线状态（原来由圆点承担），所以侧栏收起成窄条时，一眼
+ * 既看得出这是台设备，也看得出它活着没有。
+ */
+const _ICON_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+
+const ICONS = {
+  agentcore: `<svg ${_ICON_ATTRS}><rect x="7.5" y="7.5" width="9" height="9" rx="1.8"/>` +
+    `<path d="M9.8 3.2v4.3M14.2 3.2v4.3M9.8 16.5v4.3M14.2 16.5v4.3` +
+    `M3.2 9.8h4.3M3.2 14.2h4.3M16.5 9.8h4.3M16.5 14.2h4.3"/></svg>`,
+  perception: `<svg ${_ICON_ATTRS}><path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12z"/>` +
+    `<circle cx="12" cy="12" r="2.6"/></svg>`,
+  actucore: `<svg ${_ICON_ATTRS}><path d="M13.2 2.5 5 13.8h5.6L9.8 21.5 18 10.2h-5.6l.8-7.7z"/></svg>`,
+  modelhub: `<svg ${_ICON_ATTRS}><path d="M12 2.8 20.2 7.4v9.2L12 21.2 3.8 16.6V7.4z"/>` +
+    `<path d="M3.8 7.4 12 12l8.2-4.6M12 12v9.2"/></svg>`,
+  driver: `<svg ${_ICON_ATTRS}><path d="M9 2.8v5.4M15 2.8v5.4"/>` +
+    `<path d="M5.6 8.2h12.8v3.2a6.4 6.4 0 0 1-12.8 0V8.2z"/><path d="M12 17.8v3.4"/></svg>`,
+};
+
+let _scroll = null;
+let _empty  = null;
+let _backdrop = null;
+let _modal    = null;
+
+// Cached per-tool config states: { "mcp_id:tool_name": { ... } }
+let _toolConfigs = {};
+
+export function initSidebar() {
+  _scroll  = document.getElementById('sidebar-scroll');
+  _empty   = document.getElementById('sidebar-empty');
+  _backdrop = document.getElementById('tool-detail-backdrop');
+  _modal    = document.getElementById('tool-detail-modal');
+
+  document.getElementById('tool-detail-close').addEventListener('click', _hideDetail);
+  _backdrop.addEventListener('click', (e) => { if (e.target === _backdrop) _hideDetail(); });
+
+  // Search filter
+  const searchInput = document.getElementById('sidebar-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', () => _onSearchInput(searchInput.value));
+  }
+
+  _initCollapse();
+
+  // Load saved tool configs
+  _loadToolConfigs();
+}
+
+/**
+ * Collapse the sidebar to a rail.
+ *
+ * 280px is a third of a tablet in portrait, and most of the time the canvas is
+ * what you are looking at. Shut, the panel keeps a rail of the section status
+ * dots rather than disappearing: the toggle stays in the same place whichever
+ * state it is in, and which devices are up is still readable.
+ *
+ * Below 768px the sidebar is a drawer that the fab already opens and closes, so
+ * this control is hidden there and the flag is left alone — it belongs to the
+ * wide layout and should survive a trip through a narrow one.
+ */
+function _initCollapse() {
+  const sidebar = document.getElementById('sidebar');
+  const btn = document.getElementById('sidebar-collapse-btn');
+  if (!sidebar || !btn) return;
+
+  const apply = (on) => {
+    sidebar.classList.toggle('collapsed', on);
+    btn.setAttribute('aria-expanded', on ? 'false' : 'true');
+    btn.title = on ? '展开侧栏' : '收起侧栏';
+    btn.setAttribute('aria-label', btn.title);
+  };
+
+  apply(localStorage.getItem('sidebar-collapsed') === '1');
+
+  btn.addEventListener('click', () => {
+    const on = !sidebar.classList.contains('collapsed');
+    apply(on);
+    localStorage.setItem('sidebar-collapsed', on ? '1' : '0');
+  });
+}
+
+async function _loadToolConfigs() {
+  try {
+    const resp = await fetch('/api/canvas/tool-configs');
+    const data = await resp.json();
+    _toolConfigs = data.data || {};
+  } catch (e) { /* ignore */ }
+}
+
+/** Check if a tool (by mcp_id:tool_name key) has shared config saved. */
+export function isToolConfigured(mcpId, toolName) {
+  return !!_toolConfigs[`${mcpId}:${toolName}`];
+}
+
+/** Check if a specific instance has instance config saved. */
+export function isInstanceConfigured(mcpId, toolName, instanceId) {
+  return !!_toolConfigs[`${mcpId}:${toolName}:${instanceId}`];
+}
+
+/** Get all tool configs (shared + instance). */
+export function getToolConfigs() { return _toolConfigs; }
+
+/**
+ * Refresh sidebar from pre-fetched MCP list.
+ */
+export function renderSidebar(mcps, topicStatuses = {}) {
+  if (!_scroll) return;
+
+  const allMcps = mcps || [];
+  const controllers = allMcps.filter(m => m.category === 'controller');
+  const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
+  const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
+  const actucores = allMcps.filter(m => m.category === 'actucore' && m.online === true);
+  const modelhubs = allMcps.filter(m => m.category === 'modelhub' && m.online === true);
+
+  _scroll.innerHTML = '';
+
+  if (!controllers.length && !drivers.length && !perceptions.length && !actucores.length
+      && !modelhubs.length) {
+    _scroll.appendChild(_empty);
+    return;
+  }
+
+  // Controller sections (top)
+  if (controllers.length) {
+    const section = _buildControllerSection(controllers);
+    _scroll.appendChild(section);
+  }
+
+  // Perception section
+  if (perceptions.length) {
+    _scroll.appendChild(_buildMergedSection(perceptions, {
+      cls: 'sidebar-section-perception', icon: ICONS.perception, label: '感知',
+    }));
+  }
+
+  // ActuCore section
+  if (actucores.length) {
+    _scroll.appendChild(_buildMergedSection(actucores, {
+      cls: 'sidebar-section-actucore', icon: ICONS.actucore, iconCls: 'actucore', label: '执行',
+    }));
+  }
+
+  // ModelHub section
+  if (modelhubs.length) {
+    _scroll.appendChild(_buildMergedSection(modelhubs, {
+      cls: 'sidebar-section-modelhub', icon: ICONS.modelhub, iconCls: 'modelhub', label: '模型',
+      consoleEntries: true,
+    }));
+  }
+
+  // Driver sections (one per driver)
+  for (const mcp of drivers) {
+    const section = _buildSection(mcp);
+    _scroll.appendChild(section);
+  }
+}
+
+// ── Section builders ──────────────────────────────────────────────────────────
+
+const _TYPE_ORDER = ['controller', 'sensor', 'actuator', 'processor', ''];
+
+function _buildSection(mcp) {
+  const name = mcp.server_name || mcp.name || mcp.id;
+  const online = mcp.online;
+  const statusCls = online === true ? 'online' : online === false ? 'offline' : 'pending';
+
+  const section = document.createElement('div');
+  section.className = 'sidebar-section';
+
+  const header = document.createElement('div');
+  header.className = 'sidebar-section-header';
+  header.innerHTML = `
+    <span class="sidebar-section-icon driver ${_esc(statusCls)}">${ICONS.driver}</span>
+    <span class="sidebar-section-name">${_esc(name)}</span>
+    <span class="sidebar-section-count">${(mcp.tools || []).length}</span>
+  `;
+  section.appendChild(header);
+
+  const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
+  const useChip = tools.length > 6;
+
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+
+  _renderGroupedTools(grid, mcp, tools, useChip);
+
+  section.appendChild(grid);
+  return section;
+}
+
+/**
+ * Merge the tools of several MCPs of the same category into one section,
+ * grouped by tool type. Used for perception and actucore, which each may be
+ * served by more than one container but read as a single layer in the sidebar.
+ */
+function _buildMergedSection(mcps, { cls, icon, iconCls = '', label, consoleEntries = false }) {
+  const section = document.createElement('div');
+  section.className = `sidebar-section ${cls}`;
+
+  const header = document.createElement('div');
+  header.className = 'sidebar-section-header';
+  const allTools = [];
+  for (const mcp of mcps) {
+    const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
+    for (const tool of tools) {
+      if (!tool.type && (tool.topic_in || []).length && (tool.topic_out || []).length) {
+        tool.type = 'processor';
+      }
+      tool._mcp = mcp; // attach mcp ref for rendering
+      allTools.push(tool);
+    }
+  }
+  header.innerHTML = `
+    <span class="sidebar-section-icon ${_esc(iconCls)}">${icon}</span>
+    <span class="sidebar-section-name">${_esc(label)}</span>
+    <span class="sidebar-section-count">${allTools.length}</span>
+  `;
+  section.appendChild(header);
+
+  const useChip = allTools.length > 6;
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+
+  // 有运维页的常驻服务（ModelHub）列在最前，不挂「ACTUATOR」这类分组标签 ——
+  // 它是一个入口，不是一张能连线的执行卡
+  if (consoleEntries) {
+    for (const tool of allTools.filter(t => t.inputSchema?.['x-workbench'])) {
+      grid.appendChild(_buildConsoleEntry(tool._mcp, tool));
+    }
+  }
+  const rest = consoleEntries ? allTools.filter(t => !t.inputSchema?.['x-workbench']) : allTools;
+
+  // Group and render
+  const groups = {};
+  for (const tool of rest) {
+    const t = tool.type || '';
+    (groups[t] = groups[t] || []).push(tool);
+  }
+  for (const type of _TYPE_ORDER) {
+    if (!groups[type]?.length) continue;
+    grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
+    for (const tool of groups[type]) {
+      const mcp = tool._mcp;
+      grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
+    }
+  }
+
+  section.appendChild(grid);
+  return section;
+}
+
+function _buildControllerSection(controllers) {
+  const section = document.createElement('div');
+  section.className = 'sidebar-section sidebar-section-controller';
+
+  const header = document.createElement('div');
+  header.className = 'sidebar-section-header';
+  const totalTools = controllers.reduce((s, m) => s + (m.tools || []).length, 0);
+  header.innerHTML = `
+    <span class="sidebar-section-icon controller">${ICONS.agentcore}</span>
+    <span class="sidebar-section-name">AgentCore</span>
+    <span class="sidebar-section-count">${totalTools}</span>
+  `;
+  section.appendChild(header);
+
+  const useChip = totalTools > 6;
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+
+  const allTools = [];
+  for (const mcp of controllers) {
+    const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
+    for (const tool of tools) {
+      if (!tool.type) tool.type = 'controller';
+      tool._mcp = mcp;
+      allTools.push(tool);
+    }
+  }
+  _renderGroupedTools(grid, null, allTools, useChip);
+
+  section.appendChild(grid);
+  return section;
+}
+
+// ── Grouped rendering helpers ─────────────────────────────────────────────────
+
+function _renderGroupedTools(grid, defaultMcp, tools, useChip) {
+  const groups = {};
+  for (const tool of tools) {
+    const t = tool.type || '';
+    (groups[t] = groups[t] || []).push(tool);
+  }
+  for (const type of _TYPE_ORDER) {
+    if (!groups[type]?.length) continue;
+    grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
+    for (const tool of groups[type]) {
+      const mcp = tool._mcp || defaultMcp;
+      grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
+    }
+  }
+}
+
+function _buildSubgroupLabel(type, count) {
+  const label = document.createElement('div');
+  label.className = 'sidebar-subgroup-label';
+  const displayName = type ? type.toUpperCase() : 'OTHER';
+  label.textContent = `${displayName} · ${count}`;
+  return label;
+}
+
+/** Does the sidebar still own this tool's configuration?
+ *
+ * Only while the tool has no card on the canvas. Once a card exists that card's
+ * dialog sets everything, tool-level fields included, and a second entry point
+ * is how one card's settings and another's drift apart — the split across two
+ * dialogs is how r1_bj ended up with a YOLO fit selected under DepthART.
+ *
+ * **One function because there were two copies of this test.** The gear on the
+ * chip and the status on the tool card each recomputed it, I gated only the
+ * second, and the chip went on opening the dialog I had just removed. Two
+ * copies of a rule that must agree is the bug, not the symptom.
+ */
+function sidebarOwnsConfig(mcpId, tool) {
+  const schema = typeof tool === 'object' ? tool.configSchema : null;
+  if (!schema) return false;
+  const props = Object.values(schema.properties || {});
+  if (!props.some(def => def.scope !== 'instance')) return false;   // nothing to set here
+
+  // **Only step aside if the card can actually take over.** A card's dialog
+  // exists only when the tool has instance-scope fields (`canvas.js`, the
+  // `hasInstanceFields` test that renders the gear). A tool whose settings are
+  // all shared — `loco_servo`, whose config is `dry_run`, `rotate_only` and
+  // `require_standing` — gets no dialog on its card, so hiding the sidebar
+  // entry for it removed the only way to reach those settings. On R1 that put
+  // `dry_run` out of reach, which is not a cosmetic field on a chassis.
+  if (!props.some(def => def.scope === 'instance')) return true;
+
+  return cardsForTool(mcpId, tool.name).length === 0;
+}
+
+/**
+ * ModelHub 这类常驻服务在侧边栏是一个入口，不是可以拖上画布的卡片。
+ *
+ * 它不跟着智能控制起停（start/stop 只是查状态），决策核心也是自己找到它、
+ * 不靠画布连线 —— 放上画布唯一的用处是能点开运维页，而那一步本身就是绕路。
+ * 点这里直接打开模型管理，开启控制前后都能用。
+ */
+function _buildConsoleEntry(mcp, tool) {
+  const entry = document.createElement('button');
+  entry.type = 'button';
+  entry.className = 'sidebar-console-entry';
+  entry.dataset.mcpId = mcp.id;
+  entry.dataset.toolName = tool.name;
+  const title = tool.inputSchema['x-workbench'].title || '模型管理';
+  entry.innerHTML = `
+    <span class="console-entry-name">${_esc(title)}</span>
+    <span class="console-entry-desc">下载、启动、对话、性能测试、监控</span>`;
+  entry.addEventListener('click', async () => {
+    try {
+      const { openToolConsole } = await import('./workbench.js');
+      await openToolConsole(mcp.id, tool);
+    } catch (err) {
+      alert(`打不开${title}：${err.message}`);
+    }
+  });
+  return entry;
+}
+
+function _buildChip(mcp, tool) {
+  const chip = document.createElement('div');
+  const toolType = tool.type || '';
+  chip.className = `sidebar-chip${toolType ? ' type-' + toolType : ''}`;
+  chip.draggable = true;
+  chip.dataset.mcpId = mcp.id;
+  chip.dataset.toolName = tool.name;
+  chip.dataset.desc = (tool.description || '').toLowerCase();
+  chip.title = tool.description || tool.name;
+
+  // Config button for tools with shared fields
+  const configSchema = typeof tool === 'object' ? tool.configSchema : null;
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
+  const configKey = `${mcp.id}:${tool.name}`;
+  // 「已配置」只看会产生输入的字段。纯展示字段（二维码）永远不保存任何值，
+  // 把它算进来的话，一个只声明了二维码的工具会永久挂着未配置的警告三角。
+  // 齿轮按钮照旧按 hasSharedFields 出现 —— 正因为要点开它才看得到二维码。
+  const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
+    .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
+  const configured = needsInput ? !!_toolConfigs[configKey] : true;
+
+  const configBtnHtml = hasSharedFields
+    ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
+    : '';
+  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span><button class="mobile-add-btn" title="添加到画布">+</button>${configBtnHtml}`;
+
+  // Mobile add-to-canvas button
+  chip.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const added = await addCardFromSidebar({
+      mcpId: mcp.id, toolName: tool.name,
+      driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields,
+      multiInstance: !!(tool.multiInstance),
+    });
+    if (added) closeSidebarMobile();
+  });
+
+  // Config button click
+  if (hasSharedFields) {
+    chip.querySelector('.chip-config-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      openToolConfigModal(mcp.id, tool.name, configSchema);
+    });
+  }
+
+  // Click to show detail
+  chip.addEventListener('click', (e) => {
+    if (e.defaultPrevented) return;
+    _showDetail(mcp, tool);
+  });
+
+  chip.addEventListener('dragstart', (e) => {
+    chip.classList.add('dragging-source');
+    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
+      mcpId: mcp.id, toolName: tool.name, driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields, configured,
+      multiInstance: !!(tool.multiInstance),
+      hasInstanceConfig: _hasInstanceFields(configSchema),
+    }));
+  });
+  chip.addEventListener('dragend', () => chip.classList.remove('dragging-source'));
+
+  return chip;
+}
+
+// ── Search filter ─────────────────────────────────────────────────────────────
+
+function _onSearchInput(query) {
+  if (!_scroll) return;
+  const q = query.trim().toLowerCase();
+
+  // Filter cards and chips
+  const items = _scroll.querySelectorAll('.sidebar-tool-card, .sidebar-chip');
+  for (const el of items) {
+    const name = (el.dataset.toolName || '').toLowerCase();
+    const desc = (el.dataset.desc || '').toLowerCase();
+    const match = !q || name.includes(q) || desc.includes(q);
+    el.classList.toggle('hidden', !match);
+  }
+
+  // Hide subgroup labels if all items in that group are hidden
+  const labels = _scroll.querySelectorAll('.sidebar-subgroup-label');
+  for (const label of labels) {
+    let next = label.nextElementSibling;
+    let hasVisible = false;
+    while (next && !next.classList.contains('sidebar-subgroup-label')) {
+      if ((next.classList.contains('sidebar-tool-card') || next.classList.contains('sidebar-chip')) && !next.classList.contains('hidden')) {
+        hasVisible = true;
+        break;
+      }
+      next = next.nextElementSibling;
+    }
+    label.classList.toggle('hidden', !hasVisible);
+  }
+
+  // Hide sections if all their content is hidden
+  const sections = _scroll.querySelectorAll('.sidebar-section');
+  for (const sec of sections) {
+    const visibleItems = sec.querySelectorAll('.sidebar-tool-card:not(.hidden), .sidebar-chip:not(.hidden)');
+    sec.classList.toggle('hidden', visibleItems.length === 0);
+  }
+}
+
+// ── Tool card ─────────────────────────────────────────────────────────────────
+
+function _buildToolCard(mcp, tool) {
+  const card = document.createElement('div');
+  const toolType = tool.type || '';
+  card.className = `sidebar-tool-card${toolType ? ' type-' + toolType : ''}`;
+  card.draggable = true;
+  card.dataset.mcpId = mcp.id;
+  card.dataset.toolName = tool.name;
+  card.dataset.desc = (tool.description || '').toLowerCase();
+
+  const configSchema = typeof tool === 'object' ? tool.configSchema : null;
+  const configKey = `${mcp.id}:${tool.name}`;
+  // Only tools with shared (non-instance-scope) fields need sidebar-level
+  // configuration — **and only while the tool has no card on the canvas.**
+  //
+  // Once a card exists, that card's dialog sets everything, tool-level fields
+  // included, so keeping this entry would leave two places to change one
+  // setting. That is not merely redundant: per-camera numbers are only
+  // meaningful against the shared model they were measured on, and splitting
+  // the two across dialogs is how r1_bj ended up with a YOLO fit selected
+  // under DepthART.
+  //
+  // It is not removed outright because a tool with no card still has to be
+  // configurable — ASR's url/key has to be set before placing one.
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
+  // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
+  const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
+    .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
+  const configured = needsInput ? !!_toolConfigs[configKey] : true;
+
+  // Badge
+  const badgeHtml = toolType
+    ? `<span class="cap-type-badge ${_esc(toolType)}">${_esc(toolType)}</span>`
+    : '';
+
+  // Config status indicator — only for tools that have shared fields to configure
+  const configHtml = hasSharedFields
+    ? `<span class="tool-card-config-status ${configured ? 'configured' : 'unconfigured'}" title="${configured ? 'Configured' : 'Not configured'}">${configured ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'}</span>`
+    : '';
+
+  // Description (truncated)
+  const desc = tool.description || '';
+  const descHtml = desc ? `<div class="tool-card-desc" title="${_esc(desc)}">${_esc(desc)}</div>` : '';
+
+  card.innerHTML = `
+    <div class="tool-card-header">
+      <div class="tool-card-title-row">
+        ${badgeHtml}
+        <span class="tool-card-name" title="${_esc(tool.name)}">${_esc(tool.name)}</span>
+      </div>
+      <div class="tool-card-actions">
+        <button class="mobile-add-btn" title="添加到画布">+</button>
+        ${hasSharedFields ? '<button class="tool-card-config-btn" title="配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>' : ''}
+        <button class="tool-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
+      </div>
+    </div>
+    ${descHtml}
+    ${configHtml}
+  `;
+
+  // Detail button
+  card.querySelector('.tool-card-info-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    _showDetail(mcp, tool);
+  });
+
+  // Mobile add-to-canvas button
+  card.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const added = await addCardFromSidebar({
+      mcpId: mcp.id, toolName: tool.name,
+      driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields,
+      multiInstance: !!(tool.multiInstance),
+    });
+    if (added) closeSidebarMobile();
+  });
+
+  // Config button (only rendered for tools with shared fields)
+  if (hasSharedFields) {
+    card.querySelector('.tool-card-config-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openToolConfigModal(mcp.id, tool.name, configSchema);
+    });
+  }
+
+  // Drag (for canvas drop)
+  card.addEventListener('dragstart', (e) => {
+    card.classList.add('dragging-source');
+    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
+      mcpId: mcp.id, toolName: tool.name, driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields, configured,
+      multiInstance: !!(tool.multiInstance),
+      hasInstanceConfig: _hasInstanceFields(configSchema),
+    }));
+  });
+  card.addEventListener('dragend', () => card.classList.remove('dragging-source'));
+
+  return card;
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/**
+ * True for schema types that cannot round-trip through a plain text input.
+ *
+ * Setting `input.value` to an object coerces it to the literal string
+ * "[object Object]", which then gets persisted and pushed to the plugin — where
+ * e.g. perception's ocr does `dict("[object Object]")` and dies. Arrays fail the
+ * same way: the plugin expects a list and gets a string.
+ */
+function _isStructuredField(def) {
+  return def.type === 'object' || def.type === 'array';
+}
+
+/** A comma-separated line is friendlier than JSON for a plain list of strings. */
+function _isStringList(def) {
+  return def.type === 'array' && (def.items || {}).type === 'string';
+}
+
+/** Build the input element for a structured (object/array) config field. */
+function _makeStructuredInput(key, def, saved) {
+  const value = saved !== undefined ? saved : def.default;
+  if (_isStringList(def)) {
+    const input = document.createElement('input');
+    input.className = 'tool-config-input';
+    input.dataset.key = key;
+    input.dataset.valueKind = 'string-list';
+    input.type = 'text';
+    input.placeholder = '逗号分隔，如 person, chair';
+    input.value = Array.isArray(value) ? value.join(', ') : (value == null ? '' : String(value));
+    return input;
+  }
+  const input = document.createElement('textarea');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  input.dataset.valueKind = 'json';
+  input.rows = 4;
+  input.placeholder = def.default != null ? JSON.stringify(def.default, null, 2) : '{ }';
+  input.value = value == null ? '' : JSON.stringify(value, null, 2);
+  return input;
+}
+
+/**
+ * Read one config input into its schema-typed value.
+ * Throws with a field-scoped message when a JSON field will not parse, so the
+ * modal can refuse to save rather than persist a corrupt value.
+ */
+function _readConfigValue(input, def) {
+  const raw = input.value.trim();
+  const kind = input.dataset.valueKind;
+  if (kind === 'string-list') {
+    return raw.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  if (kind === 'json') {
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`${def?.title || input.dataset.key}: JSON 格式错误 — ${err.message}`);
+    }
+  }
+  if (def?.type === 'integer') return parseInt(raw, 10);
+  if (def?.type === 'number')  return parseFloat(raw);
+  if (def?.type === 'boolean') return raw === 'true';
+  return raw;
+}
+
+/** Check if a configSchema has any instance-scope fields. */
+/**
+ * A <select> listing the browser's media input devices of one kind.
+ *
+ * Shared by the `audio-input-device` and `video-input-device` config formats,
+ * and by both places that build a config form. It was already duplicated
+ * verbatim once before video needed it; a third and fourth copy is how the two
+ * drift apart.
+ *
+ * Labels are only exposed after permission is granted, so a stream is requested
+ * and released immediately just to read them — otherwise every device shows up
+ * as an opaque id.
+ */
+function _mediaDeviceInput(kind, key, saved) {
+  const constraint = kind === 'videoinput' ? { video: true } : { audio: true };
+  const noun = kind === 'videoinput' ? 'Camera' : 'Microphone';
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+    // Non-secure context (plain HTTP) — the API is unavailable, so offer a
+    // text field rather than an empty select the user cannot act on.
+    const input = document.createElement('input');
+    input.className = 'tool-config-input';
+    input.dataset.key = key;
+    input.type = 'text';
+    input.placeholder = 'Requires HTTPS or localhost';
+    input.value = saved;
+    return input;
+  }
+
+  const input = document.createElement('select');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  const loadingOpt = document.createElement('option');
+  loadingOpt.value = '';
+  loadingOpt.textContent = 'Loading devices...';
+  input.appendChild(loadingOpt);
+
+  navigator.mediaDevices.getUserMedia(constraint).then(stream => {
+    stream.getTracks().forEach(t => t.stop());   // release immediately
+    return navigator.mediaDevices.enumerateDevices();
+  }).then(devices => {
+    input.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = '-- Default --';
+    input.appendChild(defaultOpt);
+    for (const d of devices.filter(d => d.kind === kind)) {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `${noun} ${d.deviceId.slice(0, 8)}`;
+      if (saved === d.deviceId) opt.selected = true;
+      input.appendChild(opt);
+    }
+    if (saved) input.value = saved;
+  }).catch(() => {
+    input.innerHTML = '';
+    const errOpt = document.createElement('option');
+    errOpt.value = '';
+    errOpt.textContent = 'Permission denied';
+    input.appendChild(errOpt);
+  });
+  return input;
+}
+
+function _hasInstanceFields(configSchema) {
+  if (!configSchema || !configSchema.properties) return false;
+  return Object.values(configSchema.properties).some(def => def.scope === 'instance');
+}
+
+/** Check if a configSchema has any shared-scope required fields. */
+export function hasSharedRequired(configSchema) {
+  if (!configSchema) return false;
+  const props = configSchema.properties || {};
+  const required = configSchema.required || [];
+  return required.some(k => props[k] && props[k].scope !== 'instance');
+}
+
+/**
+ * decision_core 的「大模型」：云端或本机，二选一。
+ *
+ * 选本机时不挑具体模型 —— 用 ModelHub 当前加载的那个，换模型在模型管理里做。
+ * 所以这里只显示一行状态：现在跑的是哪个模型、上下文多长；用不了时说清楚为什么、
+ * 去哪里处理。状态打开时现查，ModelHub 那边刚加载好的模型不用重启 agent-core。
+ *
+ * 值放在一个隐藏 input 上（带 data-key），切换时派发 change —— 保存按 [data-key]
+ * 收值、x-show-when 按它的 value 判断，和其他字段走同一条路。
+ */
+const _LLM_SOURCES = [
+  { value: 'cloud',    label: '云端' },
+  { value: 'modelhub', label: '本机' },
+];
+
+/** 没装 ModelHub 时，按这台机器能不能装，给一句该怎么办。 */
+function _modelhubInstallHint(install) {
+  if (install.available) {
+    return { canInstall: true,
+             text: '本机模型由 ModelHub 提供。装好后在模型管理里下载并启动一个模型，这里会自动用上。' };
+  }
+  if (install.reason === 'unsupported') {
+    return { unsupported: true,
+             text: '本机模型由 ModelHub 提供，它目前只支持 Jetson Thor（JetPack 7）。这台机器请用云端模型。' };
+  }
+  if (install.reason === 'not_published') {
+    return { text: '部署列表里还没有这台机器能用的 ModelHub 版本，请管理员先发布。现在请先用云端模型。' };
+  }
+  return { text: '本机模型由 ModelHub 提供，请先在「设置 → 部署」里安装。' };
+}
+
+/** 「打开模型管理」：运维页叠在设置框上面打开，关掉后回到这里，状态自动刷新。 */
+let _refreshLlmStatus = null;
+function _openConsoleButton(label) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = label;
+  b.addEventListener('click', async () => {
+    try {
+      const { openModelConsole } = await import('./workbench.js');
+      await openModelConsole(() => _refreshLlmStatus?.());
+    } catch (err) {
+      alert(`打不开模型管理：${err.message}`);
+    }
+  });
+  return b;
+}
+
+function _installModelhubButton() {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = '去部署里安装 ModelHub';
+  b.addEventListener('click', () => {
+    // 先关掉配置框：部署面板是另一个 modal，叠在上面会把两个框的按钮搅在一起
+    document.getElementById('tool-config-overlay')?.classList.add('hidden');
+    openDeployPanel({ tab: 'marketplace', query: 'modelhub' });
+  });
+  return b;
+}
+
+function _llmSourceInput(key, saved) {
+  const wrap = document.createElement('div');
+  wrap.className = 'llm-source';
+
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.dataset.key = key;
+  input.value = saved === 'modelhub' ? 'modelhub' : 'cloud';
+
+  const seg = document.createElement('div');
+  seg.className = 'llm-source-seg';
+  seg.setAttribute('role', 'radiogroup');
+  seg.setAttribute('aria-label', '大模型');
+
+  const status = document.createElement('div');
+  status.className = 'llm-source-status';
+  status.setAttribute('aria-live', 'polite');
+  // 操作放在状态框外面：框里只说「现在是什么情况」，按钮是对整个 ModelHub 的操作，
+  // 放进框里会读成「对这个模型做点什么」
+  const actions = document.createElement('div');
+  actions.className = 'llm-source-actions';
+
+  const buttons = _LLM_SOURCES.map(({ value, label }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'llm-source-opt';
+    b.dataset.value = value;
+    b.setAttribute('role', 'radio');
+    b.textContent = label;
+    b.addEventListener('click', () => select(value));
+    seg.appendChild(b);
+    return b;
+  });
+
+  let local = null;     // 最近一次查到的本机状态
+  function select(value) {
+    input.value = value;
+    for (const b of buttons) {
+      const on = b.dataset.value === value;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    }
+    renderStatus();
+    input.dispatchEvent(new Event('change'));
+  }
+
+  function renderStatus() {
+    status.hidden = actions.hidden = input.value !== 'modelhub';
+    if (status.hidden) return;
+    status.innerHTML = '';
+    actions.innerHTML = '';
+    const dot = document.createElement('span');
+    dot.className = 'llm-source-dot';
+    const main = document.createElement('div');
+    main.className = 'llm-source-main';
+    const note = document.createElement('div');
+    note.className = 'llm-source-note';
+    let action = null;
+    if (!local) {
+      dot.dataset.state = 'pending';
+      main.textContent = '正在查本机模型…';
+    } else if (local.state === 'ready') {
+      dot.dataset.state = 'ready';
+      main.textContent = local.title;
+      if (local.context_tokens) {
+        const ctx = document.createElement('span');
+        ctx.className = 'llm-source-ctx';
+        ctx.textContent = `上下文 ${Math.round(local.context_tokens / 1000)}k`;
+        main.appendChild(ctx);
+      }
+      note.textContent = 'ModelHub 当前加载的模型。换模型在模型管理里操作，这里自动跟上。';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.state === 'absent') {
+      // 没装不是故障：灰点。说清楚本机模型从哪来、这台机器上该怎么办
+      dot.dataset.state = 'off';
+      const how = _modelhubInstallHint(local.install || {});
+      // 装不了的机器别说「还没装」—— 那句话暗示装上就行
+      main.textContent = how.unsupported ? '这台机器用不了本机模型' : '这台机器还没装 ModelHub';
+      note.textContent = how.text;
+      if (how.canInstall) action = _installModelhubButton();
+    } else if (local.state === 'unreachable') {
+      dot.dataset.state = 'down';
+      main.textContent = 'ModelHub 没有回应';
+      note.textContent = '它已经装了，但现在不在线。到「设置 → 部署 → 我的服务」看看它是否在运行。';
+    } else if (local.state === 'error') {
+      dot.dataset.state = 'down';
+      main.textContent = `${local.title || '本机模型'} 启动失败`;
+      note.textContent = local.message || '';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.state === 'loading') {
+      dot.dataset.state = 'loading';
+      main.textContent = (local.title || '本机模型') + ' 正在加载';
+      note.textContent = local.message || '';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.downloaded === 0) {
+      // 装了 ModelHub 但一个模型都没下载：要做的是「下载」，不是「启动」
+      dot.dataset.state = 'off';
+      main.textContent = 'ModelHub 里还没有模型';
+      note.textContent = '先在模型管理里下载一个模型并启动，这里会自动用上。';
+      action = _openConsoleButton('去模型管理下载模型');
+    } else {
+      dot.dataset.state = 'off';
+      main.textContent = local.downloaded
+        ? `已下载 ${local.downloaded} 个模型，还没有启动`
+        : 'ModelHub 还没有启动模型';
+      note.textContent = '在模型管理里启动一个模型，这里会自动用上。';
+      action = _openConsoleButton('去模型管理启动模型');
+    }
+    status.append(dot, main);
+    if (note.textContent) status.appendChild(note);
+    if (action) actions.appendChild(action);
+    actions.hidden = !action;
+  }
+
+  wrap.append(input, seg, status, actions);
+  select(input.value);
+
+  const load = () => fetch('/api/config/local-llm')
+    .then(r => r.json())
+    .then(json => {
+      local = (json && json.data) || { state: 'unreachable', message: '查不到本机模型。' };
+      // 没装 ModelHub 时「本机」照样能点：点了才看得到为什么不能用、该怎么办。
+      // 置灰 + 悬停提示在触屏和 Safari 上等于什么都没说。
+      renderStatus();
+    })
+    .catch(() => {
+      local = { state: 'unreachable', message: '查不到本机模型，检查 agent-core 是否在线。' };
+      renderStatus();
+    });
+  _refreshLlmStatus = () => { local = null; renderStatus(); load(); };
+  load();
+  return wrap;
+}
+
+// ── Tool config modal (shared fields only) ────────────────────────────────────
+
+export async function openToolConfigModal(mcpId, toolName, configSchema) {
+  // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
+  // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
+  const liveEditable = mcpId === 'agentcore' && toolName === 'decision_core';
+  if (isProjectRunning() && !liveEditable) {
+    alert('Stop agent before modifying');
+    return;
+  }
+  const overlay = document.getElementById('tool-config-overlay');
+  const titleEl = document.getElementById('tool-config-title');
+  const bodyEl  = document.getElementById('tool-config-body');
+  const saveBtn = document.getElementById('tool-config-save');
+
+  titleEl.textContent = `Configure ${toolName}`;
+  bodyEl.innerHTML = '';
+
+  const props = configSchema.properties || {};
+  const required = configSchema.required || [];
+  const configKey = `${mcpId}:${toolName}`;
+  const savedValues = _toolConfigs[configKey] || {};
+
+  // If all fields are instance-scope, show them here too (as shared defaults)
+  const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
+
+  for (const [key, def] of Object.entries(props)) {
+    // Skip instance-scope fields only if there are also shared fields
+    if (hasSharedFields && def.scope === 'instance') continue;
+    const fieldWrapper = document.createElement('div');
+    fieldWrapper.className = 'tool-config-field';
+    if (def['x-show-when']) fieldWrapper.dataset.showWhen = JSON.stringify(def['x-show-when']);
+    if (def['x-hide-when']) fieldWrapper.dataset.hideWhen = JSON.stringify(def['x-hide-when']);
+
+    const label = document.createElement('label');
+    label.className = 'tool-config-label';
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
+
+    let input;
+    if (def.oneOf && Array.isArray(def.oneOf)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- Select --`;
+      input.appendChild(placeholder);
+      for (const item of def.oneOf) {
+        const option = document.createElement('option');
+        option.value = item.const ?? '';
+        option.textContent = item.title || String(item.const);
+        if (String(savedValues[key]) === String(item.const)) option.selected = true;
+        input.appendChild(option);
+      }
+      if (savedValues[key] != null) input.value = savedValues[key];
+    } else if (def.enum && Array.isArray(def.enum)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const effectiveValue = savedValues[key] ?? def.default ?? '';
+      if (!effectiveValue) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = `-- Select --`;
+        input.appendChild(placeholder);
+      }
+      for (const opt of def.enum) {
+        const option = document.createElement('option');
+        option.value = opt;
+        option.textContent = opt;
+        if (effectiveValue === opt) option.selected = true;
+        input.appendChild(option);
+      }
+      input.value = effectiveValue;
+    } else if (def.type === 'boolean') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const optTrue = document.createElement('option');
+      optTrue.value = 'true'; optTrue.textContent = 'Yes';
+      const optFalse = document.createElement('option');
+      optFalse.value = 'false'; optFalse.textContent = 'No';
+      input.appendChild(optTrue);
+      input.appendChild(optFalse);
+      input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'audio-input-device'
+               || def.format === 'video-input-device') {
+      input = _mediaDeviceInput(
+        def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
+        key, savedValues[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
+    } else if (def.format === 'channel-select') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const saved = savedValues[key] || '';
+      const loadingOpt = document.createElement('option');
+      loadingOpt.value = '';
+      loadingOpt.textContent = 'Loading channels...';
+      input.appendChild(loadingOpt);
+      fetch('/api/channel/list').then(r => r.json()).then(data => {
+        input.innerHTML = '';
+        const channels = data.channels || [];
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = channels.length ? '-- Select channel --' : '-- No channels configured --';
+        input.appendChild(placeholder);
+        for (const ch of channels) {
+          const opt = document.createElement('option');
+          opt.value = ch.id;
+          opt.textContent = `${ch.id} (${ch.platform})`;
+          if (saved === ch.id) opt.selected = true;
+          input.appendChild(opt);
+        }
+        if (saved) input.value = saved;
+      }).catch(() => {
+        input.innerHTML = '';
+        const errOpt = document.createElement('option');
+        errOpt.value = '';
+        errOpt.textContent = 'Failed to load channels';
+        input.appendChild(errOpt);
+      });
+    } else if (isDisplayOnly(def)) {
+      // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
+      input = makeQrField(key, def);
+    } else if (_isStructuredField(def)) {
+      input = _makeStructuredInput(key, def, savedValues[key]);
+    } else {
+      input = document.createElement('input');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
+      if (def.type === 'number' || def.type === 'integer') input.step = 'any';
+      input.placeholder = def.default != null ? String(def.default) : '';
+      input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
+    }
+
+    fieldWrapper.appendChild(label);
+    fieldWrapper.appendChild(input);
+    bodyEl.appendChild(fieldWrapper);
+  }
+
+  // x-show-when / x-hide-when: toggle field visibility based on controlling field value.
+  // A condition value may be a single value or an array; an array means "any of
+  // these". That is what lets one field depend on a subset of another field's enum
+  // — e.g. the ASR device selector only applies to the models that have GPU
+  // weights, so it hides itself for the rest instead of offering a choice the
+  // plugin would reject.
+  const _condMatches = (condVal, actual) =>
+    Array.isArray(condVal) ? condVal.includes(actual) : actual === condVal;
+  function _applyShowWhen() {
+    bodyEl.querySelectorAll('.tool-config-field[data-show-when]').forEach(el => {
+      const cond = JSON.parse(el.dataset.showWhen);
+      let visible = true;
+      for (const [condKey, condVal] of Object.entries(cond)) {
+        const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
+        if (ctrl && !_condMatches(condVal, ctrl.value)) { visible = false; break; }
+      }
+      el.style.display = visible ? '' : 'none';
+    });
+    bodyEl.querySelectorAll('.tool-config-field[data-hide-when]').forEach(el => {
+      const cond = JSON.parse(el.dataset.hideWhen);
+      let hidden = false;
+      for (const [condKey, condVal] of Object.entries(cond)) {
+        const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
+        if (ctrl && _condMatches(condVal, ctrl.value)) { hidden = true; break; }
+      }
+      el.style.display = hidden ? 'none' : '';
+    });
+  }
+  // Attach change listeners to controlling fields
+  const showWhenKeys = new Set();
+  bodyEl.querySelectorAll('.tool-config-field[data-show-when]').forEach(el => {
+    const cond = JSON.parse(el.dataset.showWhen);
+    Object.keys(cond).forEach(k => showWhenKeys.add(k));
+  });
+  bodyEl.querySelectorAll('.tool-config-field[data-hide-when]').forEach(el => {
+    const cond = JSON.parse(el.dataset.hideWhen);
+    Object.keys(cond).forEach(k => showWhenKeys.add(k));
+  });
+  for (const k of showWhenKeys) {
+    const ctrl = bodyEl.querySelector(`[data-key="${k}"]`);
+    if (ctrl) ctrl.addEventListener('change', _applyShowWhen);
+  }
+  _applyShowWhen();
+
+  // Handlers
+  const close = () => { overlay.classList.add('hidden'); };
+  const save = async () => {
+    if (!(await ensureEdit())) return;
+    const values = {};
+    for (const input of bodyEl.querySelectorAll('[data-key]')) {
+      if (!input.value.trim()) continue;
+      // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
+      const fieldWrapper = input.closest('.tool-config-field');
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
+      try {
+        values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
+      } catch (err) {
+        alert(err.message);
+        return;
+      }
+    }
+
+    // Save to per-tool API
+    try {
+      const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(values),
+      });
+      if (!resp.ok) {
+        alert(`配置保存失败 (HTTP ${resp.status})`);
+        return;
+      }
+    } catch (err) {
+      alert('配置保存失败: ' + err.message);
+      console.error('[config] save failed:', err);
+      return;
+    }
+
+    // Update local cache
+    _toolConfigs[configKey] = values;
+
+    // Update sidebar card status indicator
+    const card = _scroll.querySelector(`.sidebar-tool-card[data-mcp-id="${mcpId}"][data-tool-name="${toolName}"]`);
+    if (card) {
+      const statusEl = card.querySelector('.tool-card-config-status');
+      if (statusEl) {
+        statusEl.className = 'tool-card-config-status configured';
+        statusEl.textContent = '✓';
+        statusEl.title = 'Configured';
+      }
+    }
+
+    close();
+  };
+
+  // Replace old listeners
+  const newSaveBtn = saveBtn.cloneNode(true);
+  saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+  newSaveBtn.addEventListener('click', save);
+
+  // Close / cancel buttons
+  const closeBtn = document.getElementById('tool-config-close');
+  if (closeBtn) {
+    const newCloseBtn = closeBtn.cloneNode(true);
+    closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
+    newCloseBtn.addEventListener('click', close);
+  }
+  const cancelBtn = document.getElementById('tool-config-cancel');
+  if (cancelBtn) {
+    const newCancelBtn = cancelBtn.cloneNode(true);
+    cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+    newCancelBtn.addEventListener('click', close);
+  }
+
+  overlay.classList.remove('hidden');
+}
+
+// ── Detail modal ──────────────────────────────────────────────────────────────
+
+export function showToolDetail(mcp, tool, opts = {}) { _showDetail(mcp, tool, opts); }
+
+function _showDetail(mcp, tool, opts = {}) {
+  const title = document.getElementById('tool-detail-title');
+  const body = document.getElementById('tool-detail-body');
+
+  // Support plain string tool names
+  const toolName = typeof tool === 'string' ? tool : tool.name;
+  title.textContent = toolName;
+
+  // Use overridden topics if provided (canvas instantiation), else fall back to tool definition
+  const topicInData  = opts.topicIn  || (typeof tool === 'object' ? tool.topic_in  : null) || [];
+  const topicOutData = opts.topicOut || (typeof tool === 'object' ? tool.topic_out : null) || [];
+  const schema       = typeof tool === 'object' && tool.inputSchema ? JSON.stringify(tool.inputSchema, null, 2) : null;
+  const description  = typeof tool === 'object' ? tool.description : null;
+
+  const topicIn  = topicInData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
+  const topicOut = topicOutData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
+
+  body.innerHTML = `
+    ${description ? `<div class="detail-section"><div class="detail-label">描述</div><div class="detail-text">${_esc(description)}</div></div>` : ''}
+    <div class="detail-section">
+      <div class="detail-label">驱动</div>
+      <div class="detail-text">${_esc(mcp.server_name || mcp.name || mcp.id)}</div>
+    </div>
+    ${topicIn ? `<div class="detail-section"><div class="detail-label">输入 Topics</div><ul class="detail-topics">${topicIn}</ul></div>` : ''}
+    ${topicOut ? `<div class="detail-section"><div class="detail-label">输出 Topics</div><ul class="detail-topics">${topicOut}</ul></div>` : ''}
+    ${schema ? `<div class="detail-section"><div class="detail-label">Input Schema</div><pre class="detail-schema">${_esc(schema)}</pre></div>` : ''}
+  `;
+
+  _backdrop.classList.remove('hidden');
+}
+
+function _hideDetail() {
+  _backdrop.classList.add('hidden');
+}
+
+// ── Instance config modal (instance-scope fields only) ────────────────────────
+
+/**
+ * Open a config modal for a specific canvas card instance.
+ * Only shows fields with scope === "instance".
+ */
+export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
+  if (isProjectRunning()) {
+    alert('Stop agent before modifying');
+    return;
+  }
+  const overlay = document.getElementById('tool-config-overlay');
+  const titleEl = document.getElementById('tool-config-title');
+  const bodyEl  = document.getElementById('tool-config-body');
+  const saveBtn = document.getElementById('tool-config-save');
+
+  titleEl.textContent = `Instance Config: ${toolName}`;
+  bodyEl.innerHTML = '';
+
+  // The fields below state what can be *changed*; nothing else in this dialog
+  // states what the tool is or what it is fixed to. That gap is invisible for a
+  // tool whose settings are the whole story, and misleading for one whose
+  // capability is baked in at build time — vop runs a TensorRT engine with a
+  // frozen class list, so "confidence and fps" is the complete set of knobs and
+  // the dialog read as though the tool had simply lost its configuration.
+  if (description) {
+    const note = document.createElement('p');
+    note.className = 'tool-config-desc';
+    note.textContent = description;
+    bodyEl.appendChild(note);
+  }
+
+  const props = (configSchema && configSchema.properties) || {};
+  const required = (configSchema && configSchema.required) || [];
+  const configKey = `${mcpId}:${toolName}:${instanceId}`;
+  const savedValues = _toolConfigs[configKey] || {};
+
+  // **The card's dialog can set everything, so there is never a second place
+  // you have to go.** Tool-level fields render here too, as real inputs, in a
+  // labelled group above the per-camera ones; on save they are split by scope
+  // and written to their own row.
+  //
+  // The split itself is real and stays — `visual_depth`'s `backend` selects one
+  // engine per process while `fps` and the calibration are per camera — but
+  // making the operator visit two dialogs to configure one card was the part
+  // that cost us. It is also not merely inconvenient: `cal_a`/`cal_b` are a fit
+  // measured against a particular depth model, and `backend` says which model
+  // is running, so editing them apart is how r1_bj ended up with a YOLO fit
+  // selected under DepthART — a factor of 2.65 on every distance.
+  //
+  // Labelled loudly because the consequence is unusual: this one group is
+  // shared, so changing it here changes it for every other card on the same
+  // tool. The sidebar keeps its own copy of these fields, which is still the
+  // only way to configure a tool that has no card on the canvas yet.
+  const sharedKeys = Object.keys(props).filter(k => props[k].scope !== 'instance');
+  let sharedHost = null;
+  if (sharedKeys.length) {
+    const box = document.createElement('div');
+    box.className = 'tool-config-shared-group';
+    const heading = document.createElement('div');
+    heading.className = 'tool-config-shared-heading';
+    heading.textContent = '工具级设置 — 改这里会同时影响这个工具的所有卡片';
+    box.appendChild(heading);
+    bodyEl.appendChild(box);
+    sharedHost = box;
+  }
+  const sharedSaved = _toolConfigs[`${mcpId}:${toolName}`] || {};
+
+  // Expert settings go in a fold. A card whose every tuning knob is laid out
+  // flat is a card nobody can configure: the pose card reached 26 fields, each
+  // labelled with its own paragraph of rationale, and finding `fps` in it meant
+  // reading all of them. A schema says which of its fields are everyday by
+  // leaving `advanced` unset; one that marks nothing keeps the flat layout it
+  // had, so this changes no card that has not opted in.
+  let advancedBox = null;
+  const advancedHost = () => {
+    if (advancedBox) return advancedBox;
+    const details = document.createElement('details');
+    details.className = 'tool-config-advanced';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced settings';
+    details.appendChild(summary);
+    bodyEl.appendChild(details);
+    advancedBox = details;
+    return details;
+  };
+
+  let hasFields = false;
+  for (const [key, def] of Object.entries(props)) {
+    const isShared = def.scope !== 'instance';
+    if (isShared && !sharedHost) continue;
+    // Shared keys live in the tool-level row, not this instance's.
+    const vals = isShared ? sharedSaved : savedValues;
+    hasFields = true;
+
+    const label = document.createElement('label');
+    label.className = 'tool-config-label';
+    // `title` is the name of the setting; `description` is what it does. They
+    // were one field, so a description written to explain a trade-off became
+    // the label and the form turned into an essay. A schema with no title
+    // still falls back to its description, as before.
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
+
+    let input;
+    if (def.oneOf && Array.isArray(def.oneOf)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- Select --`;
+      input.appendChild(placeholder);
+      for (const item of def.oneOf) {
+        const option = document.createElement('option');
+        option.value = item.const ?? '';
+        option.textContent = item.title || String(item.const);
+        if (String(vals[key]) === String(item.const)) option.selected = true;
+        input.appendChild(option);
+      }
+      if (vals[key] != null) input.value = vals[key];
+    } else if (def.enum && Array.isArray(def.enum)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const effectiveValue = vals[key] ?? def.default ?? '';
+      if (!effectiveValue) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = `-- Select --`;
+        input.appendChild(placeholder);
+      }
+      for (const opt of def.enum) {
+        const option = document.createElement('option');
+        option.value = opt;
+        option.textContent = opt;
+        if (effectiveValue === opt) option.selected = true;
+        input.appendChild(option);
+      }
+      input.value = effectiveValue;
+    } else if (def.type === 'boolean') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const optTrue = document.createElement('option');
+      optTrue.value = 'true'; optTrue.textContent = 'Yes';
+      const optFalse = document.createElement('option');
+      optFalse.value = 'false'; optFalse.textContent = 'No';
+      input.appendChild(optTrue);
+      input.appendChild(optFalse);
+      input.value = (vals[key] != null ? String(vals[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'audio-input-device'
+               || def.format === 'video-input-device') {
+      input = _mediaDeviceInput(
+        def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
+        key, vals[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
+    } else if (def.format === 'channel-select') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const saved = vals[key] || '';
+      const loadingOpt = document.createElement('option');
+      loadingOpt.value = '';
+      loadingOpt.textContent = 'Loading channels...';
+      input.appendChild(loadingOpt);
+      fetch('/api/channel/list').then(r => r.json()).then(data => {
+        input.innerHTML = '';
+        const channels = data.channels || [];
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = channels.length ? '-- Select channel --' : '-- No channels configured --';
+        input.appendChild(placeholder);
+        for (const ch of channels) {
+          const opt = document.createElement('option');
+          opt.value = ch.id;
+          opt.textContent = `${ch.id} (${ch.platform})`;
+          if (saved === ch.id) opt.selected = true;
+          input.appendChild(opt);
+        }
+        if (saved) input.value = saved;
+      }).catch(() => {
+        input.innerHTML = '';
+        const errOpt = document.createElement('option');
+        errOpt.value = '';
+        errOpt.textContent = 'Failed to load channels';
+        input.appendChild(errOpt);
+      });
+    } else if (isDisplayOnly(def)) {
+      // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
+      input = makeQrField(key, def);
+    } else if (_isStructuredField(def)) {
+      input = _makeStructuredInput(key, def, vals[key]);
+    } else {
+      input = document.createElement('input');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
+      if (def.type === 'number' || def.type === 'integer') input.step = 'any';
+      input.placeholder = def.default != null ? String(def.default) : '';
+      input.value = vals[key] != null ? vals[key] : (def.default != null ? def.default : '');
+    }
+
+    // Help text, only when there is a separate title to help — otherwise the
+    // description is already serving as the label and repeating it is noise.
+    let help = null;
+    if (def.title && def.description) {
+      help = document.createElement('p');
+      help.className = 'tool-config-help';
+      help.textContent = def.description;
+    }
+
+    const host = isShared ? sharedHost : (def.advanced ? advancedHost() : bodyEl);
+    host.appendChild(label);
+    host.appendChild(input);
+    if (help) host.appendChild(help);
+  }
+
+  if (!hasFields) {
+    // Appended, not assigned: replacing innerHTML here would wipe the
+    // description above, which is exactly the case where it matters most.
+    const empty = document.createElement('p');
+    empty.style.color = 'var(--text-secondary)';
+    empty.textContent = 'No instance config fields';
+    bodyEl.appendChild(empty);
+  }
+
+  const close = () => { overlay.classList.add('hidden'); };
+  const save = async () => {
+    if (!(await ensureEdit())) return;
+    const values = {};
+    for (const input of bodyEl.querySelectorAll('[data-key]')) {
+      if (!input.value.trim()) continue;
+      // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
+      const fieldWrapper = input.closest('.tool-config-field');
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
+      try {
+        values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
+      } catch (err) {
+        alert(err.message);
+        return;
+      }
+    }
+
+    // Split by declared scope: each row only ever receives the keys it owns.
+    // A merged payload is rejected outright by plugins that keep one engine per
+    // process — see agent-core/src/tool_config.py, which is the same contract
+    // the start path applies.
+    const instanceValues = {}, sharedValues = {};
+    for (const [key, value] of Object.entries(values)) {
+      ((props[key] && props[key].scope !== 'instance') ? sharedValues : instanceValues)[key] = value;
+    }
+
+    const base = `/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`;
+    const writes = [[`${base}/${encodeURIComponent(instanceId)}`, instanceValues, configKey]];
+    // Only when the dialog actually offered shared fields, so a tool without
+    // them cannot have its tool-level row overwritten with {} from here.
+    if (sharedKeys.length) writes.push([base, sharedValues, `${mcpId}:${toolName}`]);
+
+    for (const [url, body, cacheKey] of writes) {
+      try {
+        const resp = await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          alert(`配置保存失败 (HTTP ${resp.status})`);
+          return;
+        }
+      } catch (err) {
+        alert('配置保存失败: ' + err.message);
+        console.error('[config] save failed:', url, err);
+        return;
+      }
+      _toolConfigs[cacheKey] = body;
+    }
+    close();
+  };
+
+  const newSaveBtn = saveBtn.cloneNode(true);
+  saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+  newSaveBtn.addEventListener('click', save);
+
+  const closeBtn = document.getElementById('tool-config-close');
+  if (closeBtn) {
+    const newCloseBtn = closeBtn.cloneNode(true);
+    closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
+    newCloseBtn.addEventListener('click', close);
+  }
+  const cancelBtn = document.getElementById('tool-config-cancel');
+  if (cancelBtn) {
+    const newCancelBtn = cancelBtn.cloneNode(true);
+    cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+    newCancelBtn.addEventListener('click', close);
+  }
+
+  overlay.classList.remove('hidden');
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function _esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
