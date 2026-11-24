@@ -1,0 +1,31 @@
+# Darwin subnet 273 (具身智能-TTS基础能力-不限音色榜v5 多语种 jp5,6), Jetson JP6 (JP_VERSION=6)
+# INFORMATIONAL ONLY — github-commit delivery: the platform runs the official sut
+# shell (harbor-contest.4pd.io/wanglimin/sut/robot_tts:0.0.4) and clones this repo
+# @ PHANTHYMOTUS_COMMIT_ID. We do NOT build or push a custom business image.
+#
+# Thin overlay on the official arm64 perception runtime, following the documented
+# base tag pattern (perception/README.md, deploy/build_perception.sh:
+# perception:<tag>-jetson-jp6.1). The platform wrapper launches ./start.sh from /work.
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.261030.129c70c-jetson-jp6.1
+
+WORKDIR /work
+
+# Reference TTS plugin (perception/plugins/tts.py) and full perception tree, with
+# the competition-mandated MCP_PORT/WS_PORT env-port change in main.py and the TTS
+# engine switched to kokoro-multi in config.yaml (covers >=5 leaderboard languages).
+COPY perception/ /work/perception/
+COPY start.sh /work/start.sh
+RUN chmod +x /work/start.sh
+
+# JP_VERSION 6 (JetPack 6.1, jammy base): no --ignore-installed needed anywhere;
+# per the official perception/Dockerfile.jetson docs that flag is JP5-only.
+
+ENV MCP_PORT=80 \
+    WS_PORT=15721 \
+    TTS_PLUGIN=tts \
+    JP_VERSION=6
+
+EXPOSE 80
+EXPOSE 15721
+
+CMD ["/work/start.sh"]
