@@ -1,0 +1,36 @@
+# Darwin subnet 294 (具身智能-感知能力-VOP物体识别榜), Jetson JP5.11 (JP_VERSION=5)
+# Thin overlay on the verified official arm64 perception runtime. The jp6.1
+# sibling of this release was verified by the subnet-244-asr run; the jp5.11
+# tag follows the officially documented pattern
+# (perception/README.md: perception:<tag>-jetson-jp5.11, deploy/build_perception.sh).
+# The platform wrapper launches ./start.sh from /work (WORKDIR below).
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.261030.129c70c-jetson-jp5.11
+
+WORKDIR /work
+
+# Current perception code for the vop path (reference plugin perception/plugins/vop.py
+# included verbatim; utils/ carries the sha256-pinned yoloe-26s-seg engine bundle
+# download for the jp511 TensorRT 8.5 line). Everything else (ROS, torch, TensorRT,
+# cv2) comes from the official runtime base.
+COPY perception/main.py /work/main.py
+COPY perception/config.yaml /work/config.yaml
+COPY perception/plugins/vop.py /work/plugins/vop.py
+COPY perception/utils/ /work/utils/
+COPY start.sh /work/start.sh
+RUN chmod +x /work/start.sh
+
+# JP_VERSION 5 (JetPack 5.11, focal base): the apt python3-yaml package ships
+# only egg-info metadata, which pip cannot uninstall ("Cannot uninstall 'PyYAML'...
+# distutils installed project"). Per the official perception/Dockerfile.jetson
+# docs, install PyYAML on its own with --ignore-installed (a per-invocation flag)
+# before any other pip step.
+RUN pip3 install --no-cache-dir --ignore-installed PyYAML
+
+ENV MCP_PORT=80 \
+    WS_PORT=15721 \
+    PERCEPTION_PLUGIN=vop
+
+EXPOSE 80
+EXPOSE 15721
+
+CMD ["/work/start.sh"]
