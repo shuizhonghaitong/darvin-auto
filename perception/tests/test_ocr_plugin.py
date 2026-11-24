@@ -1,0 +1,823 @@
+"""
+tests/test_ocr_plugin.py — OCR plugin lifecycle/concurrency tests (host-side).
+
+ROS stubs come from vision_stubs (installed by conftest before collection).
+Run: python -m pytest perception/tests -q
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+
+import pytest
+
+from vision_stubs import (  # noqa: F401
+    _FakeCompressedImage,
+    _FakeExecutor,
+    _FakeNode,
+    _FakeString,
+    _wait_until,
+)
+
+from utils.qos import CAMERA_QOS  # noqa: E402
+import plugins.ocr as ocr_plugin  # noqa: E402
+
+
+class _SlowOCRAdapter:
+    def __init__(self, delay=0.15):
+        self.delay = delay
+        self.seen = []
+        self.closed = False
+
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+        self.seen.append(image_bytes)
+        time.sleep(self.delay)
+        return [{"text": image_bytes.decode(), "bbox": [0, 0, 1, 1], "score": 0.99}]
+
+    def close(self):
+        self.closed = True
+
+
+class _BuilderProbe:
+    """Counts _build_ocr_adapter calls; optional delay simulates the real
+    model download + TensorRT engine build."""
+
+    def __init__(self, delay=0.0):
+        self.delay = delay
+        self.calls = 0
+        self.built = []
+        self.on_status = None
+        self.lock = threading.Lock()
+
+    def __call__(self, cfg, on_status=None):
+        # Mirrors _build_ocr_adapter: the plugin passes a status sink so the
+        # bundle download's progress reaches the card.
+        self.on_status = on_status
+        with self.lock:
+            self.calls += 1
+        if self.delay:
+            time.sleep(self.delay)
+        adapter = _SlowOCRAdapter(delay=0.01)
+        adapter.cfg = dict(cfg)
+        self.built.append(adapter)
+        return adapter
+
+
+def _make_plugin(monkeypatch, builder=None, cfg=None):
+    builder = builder or _BuilderProbe()
+    monkeypatch.setattr(ocr_plugin, "_build_ocr_adapter", builder)
+    executor = _FakeExecutor()
+    plugin = ocr_plugin.OCRPlugin(dict(cfg or {"provider": "rapidocr"}), executor)
+    return plugin, executor, builder
+
+
+def _start_and_wait(plugin, executor, topic, instance_id="", count=1):
+    args = {"action": "start", "input_topic": topic}
+    if instance_id:
+        args["instance_id"] = instance_id
+    plugin.dispatch("ocr", args)
+    # Registration now precedes start (README lifecycle rule), so a node can
+    # briefly sit in the executor as "idle"; wait for it to actually run.
+    assert _wait_until(
+        lambda: len(executor.nodes) >= count
+        and all(n.state == "running" for n in executor.nodes)
+    ), "node never came up"
+
+
+@pytest.fixture
+def ocr(monkeypatch):
+    plugin, executor, builder = _make_plugin(monkeypatch)
+    yield plugin, executor, builder
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_camera_subscription_uses_shared_qos(ocr):
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a")
+    node = executor.nodes[0]
+    assert node.subscriptions[0].qos is CAMERA_QOS
+
+
+def test_ocr_topic_change_disposes_old_node(ocr):
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="x")
+    old = executor.nodes[0]
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/b", "instance_id": "x"})
+    assert _wait_until(
+        lambda: executor.nodes and executor.nodes[-1].subscriptions
+        and executor.nodes[-1].subscriptions[0].topic == "/cam/b"
+    )
+    assert old not in executor.nodes and old.destroyed
+    assert len(executor.nodes) == 1
+
+
+def test_ocr_latest_frame_wins(ocr):
+    plugin, executor, builder = ocr
+    _start_and_wait(plugin, executor, "/cam/a")
+    node = executor.nodes[0]
+    adapter = builder.built[0]
+    callback = node.subscriptions[0].callback
+    callback(_FakeCompressedImage(b"f0"))
+    assert _wait_until(lambda: adapter.seen == [b"f0"])
+    for index in range(1, 6):
+        callback(_FakeCompressedImage(f"f{index}".encode()))
+    assert _wait_until(lambda: len(adapter.seen) >= 2)
+    time.sleep(0.2)
+    assert adapter.seen == [b"f0", b"f5"], adapter.seen
+    payload = json.loads(node.publishers[0].messages[-1])
+    assert payload["items"][0]["text"] == "f5"
+    assert "“f5”" in payload["text"]
+
+
+def test_ocr_stop_wakes_worker_promptly(ocr):
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a")
+    node = executor.nodes[0]
+    started = time.monotonic()
+    node.stop()
+    assert time.monotonic() - started < 1.0  # no 1s poll timeout wait
+    assert not node.worker_alive
+
+
+# ── OCR start/stop/load state machine ────────────────────────────────────────
+
+def test_ocr_start_returns_loading_without_blocking(monkeypatch):
+    plugin, executor, builder = _make_plugin(monkeypatch, _BuilderProbe(delay=1.0))
+    started = time.monotonic()
+    result = plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a"})
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1, f"start blocked for {elapsed:.3f}s"
+    assert result == {"state": "loading", "input": "/cam/a", "output": "/cam/a/ocr"}
+    assert _wait_until(lambda: len(executor.nodes) == 1)
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_ten_concurrent_starts_single_flight(monkeypatch):
+    plugin, executor, builder = _make_plugin(monkeypatch, _BuilderProbe(delay=0.3))
+    results = []
+
+    def call(index):
+        results.append(plugin.dispatch("ocr", {
+            "action": "start",
+            "input_topic": f"/cam/{index}",
+            "instance_id": f"inst{index}",
+        }))
+
+    threads = [threading.Thread(target=call, args=(i,)) for i in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(res["state"] == "loading" for res in results)
+    assert _wait_until(lambda: len(executor.nodes) == 10)
+    assert builder.calls == 1, "ten starts must share one model load"
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_info_does_not_block_while_loading(monkeypatch):
+    plugin, executor, builder = _make_plugin(monkeypatch, _BuilderProbe(delay=0.8))
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    started = time.monotonic()
+    info = plugin.dispatch("ocr", {"action": "info"})
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1, f"info blocked for {elapsed:.3f}s"
+    assert info["state"] == "loading"
+    assert info["instances"]["a"]["state"] == "loading"
+    assert _wait_until(
+        lambda: plugin.dispatch("ocr", {"action": "info"})["state"] == "running"
+    )
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_stop_during_loading_cancels_pending(monkeypatch):
+    plugin, executor, builder = _make_plugin(monkeypatch, _BuilderProbe(delay=0.3))
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/b", "instance_id": "b"})
+    plugin.dispatch("ocr", {"action": "stop", "instance_id": "a"})
+    assert _wait_until(lambda: len(executor.nodes) == 1)
+    time.sleep(0.2)  # loader must not resurrect the stopped instance
+    assert len(executor.nodes) == 1
+    assert executor.nodes[0].subscriptions[0].topic == "/cam/b"
+    assert plugin.dispatch(
+        "ocr", {"action": "info", "instance_id": "a"}
+    )["state"] == "idle"
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_config_during_loading_discards_stale_adapter(monkeypatch):
+    builder = _BuilderProbe(delay=0.3)
+    plugin, executor, _ = _make_plugin(
+        monkeypatch, builder, cfg={"provider": "rapidocr", "det_thresh": 0.3}
+    )
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    plugin.dispatch("ocr", {"action": "config", "det_thresh": 0.9})
+    assert _wait_until(lambda: len(executor.nodes) == 1, timeout=4)
+    assert builder.calls == 2, "config change during load must trigger a reload"
+    assert _wait_until(lambda: len(builder.built) == 2)
+    stale = next(a for a in builder.built if a.cfg["det_thresh"] == 0.3)
+    fresh = next(a for a in builder.built if a.cfg["det_thresh"] == 0.9)
+    assert _wait_until(lambda: stale.closed), "stale adapter must be closed"
+    assert plugin._adapter is fresh
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_plain_stop_fully_disposes_node(ocr):
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="a")
+    node = executor.nodes[0]
+    plugin.dispatch("ocr", {"action": "stop", "instance_id": "a"})
+    assert executor.nodes == []
+    assert node.destroyed
+    assert not node.worker_alive
+    assert plugin._nodes == {}
+
+
+def test_ocr_repeated_start_stop_does_not_grow(ocr):
+    plugin, executor, builder = ocr
+    for _ in range(20):
+        _start_and_wait(plugin, executor, "/cam/a", instance_id="a")
+        plugin.dispatch("ocr", {"action": "stop", "instance_id": "a"})
+    assert executor.nodes == []
+    assert builder.calls == 1, "adapter must be loaded once and cached"
+    assert threading.active_count() < 15
+    created = [n for n in _FakeNode.instances if n.subscriptions]
+    assert all(node.destroyed for node in created)
+
+
+def test_ocr_repeated_start_is_idempotent(ocr):
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="a")
+    first = executor.nodes[0]
+    result = plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    assert result["state"] == "running"
+    assert executor.nodes == [first]
+
+
+def test_ocr_stop_during_ready_path_start_leaves_no_orphan(monkeypatch):
+    """PR #113's orphan-node class: a stop racing a fast-path start must not
+    end with an invisible running node (stop must always see the instance in
+    _pending_starts or _nodes)."""
+    plugin, executor, builder = _make_plugin(monkeypatch)
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="a")  # adapter ready
+
+    real_start = ocr_plugin._OCRNode.start
+
+    def slow_start(self, *a, **k):
+        time.sleep(0.2)
+        return real_start(self, *a, **k)
+
+    monkeypatch.setattr(ocr_plugin._OCRNode, "start", slow_start)
+    thread = threading.Thread(target=plugin.dispatch, args=(
+        "ocr", {"action": "start", "input_topic": "/cam/b", "instance_id": "b"}))
+    thread.start()
+    time.sleep(0.05)                       # start is inside node.start()
+    plugin.dispatch("ocr", {"action": "stop", "instance_id": "b"})
+    thread.join(timeout=3)
+    monkeypatch.setattr(ocr_plugin._OCRNode, "start", real_start)
+
+    assert "b" not in plugin._nodes
+    assert plugin.dispatch("ocr", {"action": "info", "instance_id": "b"})["state"] == "idle"
+    b_nodes = [n for n in _FakeNode.instances
+               if n.subscriptions and n.subscriptions[0].topic == "/cam/b"]
+    assert all(node.destroyed for node in b_nodes), "orphan node left running"
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_info_desc_explains_loading_and_error(monkeypatch):
+    """desc carries the reason while loading / after failure, like ASR (#113)."""
+    builder = _BuilderProbe(delay=0.5)
+    plugin, executor, _ = _make_plugin(monkeypatch, builder)
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+
+    info = plugin.dispatch("ocr", {"action": "info"})
+    assert info["state"] == "loading" and "Loading" in info["desc"]
+    inst = plugin.dispatch("ocr", {"action": "info", "instance_id": "a"})
+    assert "Loading" in inst["desc"]
+
+    assert _wait_until(
+        lambda: plugin.dispatch("ocr", {"action": "info"})["state"] == "running",
+        timeout=4,
+    )
+    ready = plugin.dispatch("ocr", {"action": "info"})
+    assert ready["state"] == "running" and ready["desc"] == plugin._DESC
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_add_node_failure_leaks_nothing(monkeypatch):
+    """If executor.add_node raises during bring-up, the node must be
+    destroyed and untracked with no started worker (bot P1: a started but
+    unregistered worker would be unreachable forever)."""
+    plugin, executor, builder = _make_plugin(monkeypatch)
+
+    original_add = executor.add_node
+    calls = {"n": 0}
+
+    def flaky_add(node):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("executor shutting down")
+        return original_add(node)
+
+    monkeypatch.setattr(executor, "add_node", flaky_add)
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    assert _wait_until(lambda: calls["n"] >= 1, timeout=4)
+    time.sleep(0.1)
+
+    assert "a" not in plugin._nodes
+    assert "a" not in plugin._pending_starts, "failed instance stuck as loading"
+    failed = [n for n in _FakeNode.instances
+              if n.subscriptions == [] or (n.subscriptions and n.subscriptions[0].topic == "/cam/a")]
+    assert all(n.destroyed for n in failed if not n.subscriptions), "unregistered node leaked"
+    # worker was never started on the failed node (register-before-start)
+    assert all(not n.subscriptions for n in _FakeNode.instances if n.destroyed)
+
+    # the plugin recovers: a later start succeeds
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    assert _wait_until(lambda: "a" in plugin._nodes, timeout=4)
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_ocr_load_failure_reports_error_and_retries(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky_builder(cfg, on_status=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("download failed")
+        return _SlowOCRAdapter(delay=0.01)
+
+    monkeypatch.setattr(ocr_plugin, "_build_ocr_adapter", flaky_builder)
+    executor = _FakeExecutor()
+    plugin = ocr_plugin.OCRPlugin({"provider": "rapidocr"}, executor)
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    assert _wait_until(
+        lambda: plugin.dispatch("ocr", {"action": "info"})["state"] == "error"
+    )
+    info = plugin.dispatch("ocr", {"action": "info", "instance_id": "a"})
+    assert info["state"] == "error" and "download failed" in info.get("error", "")
+    # a later start retries the load and succeeds
+    plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a", "instance_id": "a"})
+    assert _wait_until(
+        lambda: plugin.dispatch("ocr", {"action": "info"})["state"] == "running"
+    )
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+
+
+def test_ocr_model_dir_confined_to_models_tree(monkeypatch):
+    """MCP-supplied model_dir cannot point the root-run downloader outside
+    /models (bot P2): the wrapper rejects out-of-tree paths before download."""
+    import utils.model_downloader as md
+    with pytest.raises(ValueError):
+        md.ensure_ocr_model("/etc/cron.d")
+    with pytest.raises(ValueError):
+        md.ensure_ocr_model("/models/../root")
+
+
+# ── result payload structure (LLM-consumable) ────────────────────────────────
+
+def test_ocr_payload_carries_size_and_hierarchy():
+    """Items gain height/prominence/line and the payload names its coordinate
+    frame, so an LLM consumer can tell a headline from fine print."""
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = [
+        {"text": "大标题", "bbox": [100, 40, 500, 120], "score": 0.99},   # h=80
+        {"text": "左栏", "bbox": [80, 300, 200, 340], "score": 0.95},     # h=40
+        {"text": "右栏", "bbox": [260, 305, 380, 335], "score": 0.94},    # 同一行
+        {"text": "小字注脚", "bbox": [90, 600, 220, 620], "score": 0.90}, # h=20
+    ]
+    payload = build_ocr_payload(items, 1.0, "zh", image_size=(640, 800))
+
+    assert payload["image_size"] == [640, 800]
+    heights = [item["height"] for item in payload["items"]]
+    assert heights == [80, 40, 30, 20]
+    assert payload["items"][0]["prominence"] == 1.0
+    assert payload["items"][3]["prominence"] == 0.25
+    # Existing line metadata stays available alongside the layout description.
+    lines = [item["line"] for item in payload["items"]]
+    assert lines == [0, 1, 1, 2]
+    assert "画面" in payload["text"]
+    assert all(f'“{item["text"]}”' in payload["text"] for item in items)
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == items
+
+
+def test_ocr_payload_without_frame_size_keeps_text_without_guessing_position():
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = [
+        {"text": "second", "bbox": [300, 10, 400, 50], "score": 0.9},
+        {"text": "first", "bbox": [10, 12, 120, 48], "score": 0.9},
+    ]
+    payload = build_ocr_payload(items, 0.0, "en")
+    assert "“first”" in payload["text"] and "“second”" in payload["text"]
+    assert "画面" not in payload["text"]
+    assert "image_size" not in payload
+
+
+def test_ocr_payload_empty_and_error():
+    from plugins.ocr_runtime import build_ocr_payload
+
+    empty = build_ocr_payload([], 0.0, "zh")
+    assert empty["text"] == "当前画面没有识别到可用文字。"
+    assert empty["items"] == []
+    payload = build_ocr_payload([], 0.0, "zh", error=RuntimeError("boom"))
+    assert payload["text"] == "文字识别失败，暂时无法生成描述。"
+    assert payload["items"] == []
+    assert payload["error"] == "boom"
+
+
+def test_ocr_layout_keeps_numbered_rows_in_visual_order():
+    from plugins.ocr_summary import build_ocr_summary
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = []
+    for number, title, y in [("03", "应用层", 40), ("02", "连接层", 130), ("01", "算力层", 220)]:
+        items += [
+            {"text": number, "bbox": [270, y, 292, y + 16], "score": .99},
+            {"text": title, "bbox": [350, y, 530, y + 16], "score": .99},
+        ]
+    text = build_ocr_summary(items, (1000, 400))
+    for number, title in [("03", "应用层"), ("02", "连接层"), ("01", "算力层")]:
+        assert f'原编号“{number}”，右侧邻近文字为“{title}”' in text
+    assert text.index("“03”") < text.index("“02”") < text.index("“01”")
+    payload = build_ocr_payload(items, 0.0, "zh", image_size=(1000, 400))
+    assert payload["text"] == text
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == items
+
+
+def test_ocr_layout_keeps_comparison_labels_and_values_on_their_rows():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [
+        {"text": "方案甲", "bbox": [430, 120, 585, 136], "score": .99},
+        {"text": "10", "bbox": [610, 120, 640, 136], "score": .99},
+        {"text": "方案乙", "bbox": [430, 210, 570, 226], "score": .99},
+        {"text": "1000+", "bbox": [850, 210, 915, 226], "score": .99},
+    ]
+    text = build_ocr_summary(items, (1000, 400))
+    assert "“方案甲”；同排右侧数值为“10”" in text
+    assert "“方案乙”；同排右侧数值为“1000+”" in text
+
+
+@pytest.mark.parametrize("missing_number", ["04", "03", "02", "01"])
+def test_ocr_layout_missing_index_leaves_its_visible_text_unassigned(missing_number):
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    titles = {"04": "应用层", "03": "编排层", "02": "连接层", "01": "算力层"}
+    for index, (number, title) in enumerate(titles.items()):
+        y = 40 + index * 90
+        if number != missing_number:
+            items.append({"text": number, "bbox": [270, y, 292, y + 16], "score": .99})
+        items.append({"text": title, "bbox": [350, y - 1, 530, y + 15], "score": .99})
+        items.append({"text": title + "说明", "bbox": [350, y + 22, 580, y + 34], "score": .99})
+    text = build_ocr_summary(items, (1000, 450))
+    orphan = f'“{titles[missing_number]}”'
+    assert orphan in text
+    for number, title in titles.items():
+        if number == missing_number:
+            assert f'“{number}”' not in text
+            continue
+        assert any(f'“{number}”' in line and f'“{title}”' in line for line in text.splitlines())
+        assert not any(f'“{number}”' in line and orphan in line for line in text.splitlines())
+
+
+def test_ocr_layout_alphabetic_sizes_are_not_described_as_numbers():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [x, y, x + width, y + 16], "score": .99}
+             for text, x, y, width in [("规格甲", 50, 80, 100), ("S", 300, 80, 20),
+                                       ("规格乙", 50, 180, 100), ("L", 300, 180, 20)]]
+    text = build_ocr_summary(items, (600, 300))
+    assert "同排右侧数值为" not in text
+    assert all(f'“{item["text"]}”' in text for item in items)
+
+
+def test_ocr_layout_distant_columns_are_not_forced_into_comparison_rows():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [x, y, x + width, y + 16], "score": .99}
+             for text, x, y, width in [("产品介绍", 50, 80, 160), ("1000+", 1100, 80, 65),
+                                       ("服务说明", 50, 180, 160), ("20+", 1100, 180, 50)]]
+    text = build_ocr_summary(items, (1300, 300))
+    assert "同排右侧数值为" not in text
+    assert all(f'“{item["text"]}”' in text for item in items)
+
+
+def test_ocr_layout_repeated_numbers_preserve_vertical_order():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [140, y, 180, y + 12], "score": .99}
+             for text, y in [("10", 30), ("20", 150), ("10", 270)]]
+    text = build_ocr_summary(items, (300, 330))
+    assert text.count("“10”") == 2
+    assert text.find("“10”") < text.find("“20”") < text.rfind("“10”")
+
+
+@pytest.mark.parametrize("boxes,image_size,positions", [
+    ([[50, 80, 130, 96], [750, 80, 830, 96]], (1000, 600), ["画面偏左", "画面偏右"]),
+    ([[450, 30, 530, 46], [450, 500, 530, 516]], (1000, 600), ["位于画面上部", "位于画面下部"]),
+    ([[450, 80, 530, 96], [450, 108, 530, 124]], (1000, 600), []),
+    ([[50, 80, 130, 96], [750, 80, 830, 96]], None, []),
+], ids=["left-right", "top-bottom", "nearby-lines", "unknown-size"])
+def test_ocr_layout_repeated_labels_preserve_distinct_observations(boxes, image_size, positions):
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = [{"text": "入口", "bbox": list(box), "score": .99} for box in boxes]
+    before = [{**item, "bbox": list(item["bbox"])} for item in items]
+    payload = build_ocr_payload(items, 0.0, "zh", image_size=image_size)
+    text = payload["text"]
+    assert text.count("“入口”") == 2
+    assert all(position in text for position in positions)
+    if image_size is None:
+        assert "画面" not in text
+    assert items == before
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == before
+
+
+def test_ocr_layout_repeated_labels_do_not_move_past_intervening_text():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [450, y, 530, y + 16], "score": .99}
+             for text, y in [("入口", 30), ("出口", 260), ("入口", 500)]]
+    text = build_ocr_summary(items, (1000, 600))
+    assert text.count("“入口”") == 2
+    assert text.find("“入口”") < text.find("“出口”") < text.rfind("“入口”")
+    assert "位于画面上部" in text and "位于画面下部" in text
+    assert build_ocr_summary(list(reversed(items)), (1000, 600)) == text
+
+
+def test_ocr_layout_date_columns_keep_their_nearby_text():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    for index, date in enumerate(["2020/01", "2021/02", "2022/03", "2023/04"]):
+        x = index * 150
+        items += [
+            {"text": date, "bbox": [x, 100, x + 60, 120], "score": .99},
+            {"text": f"说明{index}", "bbox": [x, 125, x + 90, 145], "score": .99},
+        ]
+    text = build_ocr_summary(items, (600, 300))
+    for index, date in enumerate(["2020/01", "2021/02", "2022/03", "2023/04"]):
+        assert any(f'“{date}”' in line and f'“说明{index}”' in line for line in text.splitlines())
+
+
+def test_ocr_layout_aligned_columns_keep_each_title_with_its_body():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    for label, x in [("甲", 20), ("乙", 220), ("丙", 420)]:
+        items += [
+            {"text": label + "标题", "bbox": [x, 40, x + 100, 60], "score": .99},
+            {"text": label + "说明", "bbox": [x, 75, x + 100, 95], "score": .99},
+        ]
+    text = build_ocr_summary(items, (600, 300))
+    assert "从左到右" in text
+    assert all(f'“{label}标题”、“{label}说明”' in text for label in ["甲", "乙", "丙"])
+
+
+# ── config surface (培育→配置) ───────────────────────────────────────────────
+
+def test_ocr_config_schema_exposes_only_operator_fields():
+    """The config UI renders configSchema verbatim; expert TensorRT/DB knobs
+    and the recognition-neutral `language` tag live in config.yaml only, and
+    no object-typed property may appear (the frontend renders those as
+    [object Object])."""
+    from plugins.ocr import TOOLS
+
+    schema = TOOLS[0]["configSchema"]
+    assert set(schema["properties"]) == {"ocr_fps"}
+    for name, spec in schema["properties"].items():
+        assert spec["type"] != "object", name
+    assert "required" not in schema
+
+
+# ── recognition rate (ocr_fps) ──────────────────────────────────────
+
+def test_default_ocr_fps_is_once_per_second():
+    """The shipped default. Text in front of a robot does not change at frame
+    rate, and the old default (every frame) kept a core busy on JPEG decode."""
+    assert ocr_plugin.ocr_interval({}) == pytest.approx(1.0)
+    assert ocr_plugin.DEFAULT_OCR_FPS == 1.0
+
+
+def test_ocr_fps_accepts_fractions():
+    assert ocr_plugin.ocr_interval({"ocr_fps": 0.5}) == pytest.approx(2.0)
+    assert ocr_plugin.ocr_interval({"ocr_fps": 4}) == pytest.approx(0.25)
+
+
+def test_ocr_fps_zero_means_every_frame():
+    assert ocr_plugin.ocr_interval({"ocr_fps": 0}) == 0.0
+    assert ocr_plugin.ocr_interval({"ocr_fps": -3}) == 0.0
+
+
+def test_legacy_min_interval_ms_still_honoured():
+    """A canvas saved by the pre-ocr_fps build must keep working — including
+    the old `min_interval_ms: 0`, which meant "every frame"."""
+    assert ocr_plugin.ocr_interval({"min_interval_ms": 500}) == pytest.approx(0.5)
+    assert ocr_plugin.ocr_interval({"min_interval_ms": 0}) == 0.0
+    # ocr_fps wins when both are present.
+    assert ocr_plugin.ocr_interval(
+        {"ocr_fps": 4, "min_interval_ms": 500}) == pytest.approx(0.25)
+
+
+def test_instance_legacy_rate_beats_plugin_default():
+    """config.yaml now ships ocr_fps, so a plain dict merge would let the
+    plugin default override a card that had only stored min_interval_ms. The
+    instance is the more specific layer and must win."""
+    merged = ocr_plugin.merge_rate_cfg(
+        {"ocr_fps": 1.0}, {"min_interval_ms": 250})
+    assert ocr_plugin.ocr_interval(merged) == pytest.approx(0.25)
+
+
+def test_instance_ocr_fps_beats_plugin_ocr_fps():
+    merged = ocr_plugin.merge_rate_cfg({"ocr_fps": 1.0}, {"ocr_fps": 5})
+    assert ocr_plugin.ocr_interval(merged) == pytest.approx(0.2)
+
+
+def test_merge_rate_cfg_keeps_unrelated_keys():
+    merged = ocr_plugin.merge_rate_cfg(
+        {"ocr_fps": 1.0, "language": "zh"}, {"min_interval_ms": 250})
+    assert merged["language"] == "zh"
+
+
+def test_ocr_fps_is_not_an_adapter_setting():
+    """Changing the rate must not rebuild the TensorRT adapter — the live
+    nodes take it in place. If it leaked into the signature, every rate tweak
+    would reload three engines."""
+    base = {"provider": "rapidocr"}
+    assert (ocr_plugin._adapter_signature({**base, "ocr_fps": 1})
+            == ocr_plugin._adapter_signature({**base, "ocr_fps": 9}))
+
+
+def test_ocr_fps_is_instance_scoped():
+    """Two cards on different cameras may read at different rates, so the
+    rate is per-instance, not a shared inference setting."""
+    from plugins.ocr import TOOLS
+
+    spec = TOOLS[0]["configSchema"]["properties"]["ocr_fps"]
+    assert spec["scope"] == "instance"
+    assert spec["default"] == ocr_plugin.DEFAULT_OCR_FPS
+
+
+# ── node-level start/stop races (bot P1, 2026-08-22) ─────────────────────────
+
+def test_ocr_concurrent_starts_yield_exactly_one_worker(ocr):
+    """_OCRNode.start() is serialized by the node lock: N concurrent starts
+    on the same instance must produce one subscription and one live worker,
+    never overwrite each other's stop event / frame slot."""
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="x")
+    node = executor.nodes[0]
+
+    barrier = threading.Barrier(8)
+    results = []
+
+    def racer():
+        barrier.wait()
+        results.append(
+            plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a",
+                                    "instance_id": "x"})
+        )
+
+    threads = [threading.Thread(target=racer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert len(executor.nodes) == 1 and executor.nodes[0] is node
+    assert len(node.subscriptions) == 1
+    live_workers = [t for t in node._worker_threads if t.is_alive()]
+    assert len(live_workers) == 1
+    assert all(r["state"] == "running" for r in results)
+
+    plugin.dispatch("ocr", {"action": "stop"})
+    assert _wait_until(lambda: not node.worker_alive)
+
+
+def test_ocr_start_on_retired_node_is_inert(ocr):
+    """A start that loses the race to stop must not touch the destroyed
+    node: retire() marks it dead under the node lock, and a late start()
+    reports idle without creating a subscription or worker."""
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="x")
+    node = executor.nodes[0]
+    plugin.dispatch("ocr", {"action": "stop", "instance_id": "x"})
+    assert node.destroyed and node not in executor.nodes
+
+    subscriptions_before = len(node.subscriptions)
+    result = node.start()   # the in-flight start that lost the race
+    assert result["state"] == "idle"
+    assert len(node.subscriptions) == subscriptions_before
+    assert not node.worker_alive
+
+
+# ── one-shot recognition ─────────────────────────────────────────────────────
+
+def _photo_plugin(monkeypatch, tmp_path):
+    """OCR plugin whose image roots are tmp_path and whose adapter is stubbed."""
+    cfg = {"provider": "rapidocr",
+           "image_roots": [str(tmp_path)],
+           "max_image_bytes": 1 << 20}
+    return _make_plugin(monkeypatch, cfg=cfg)
+
+
+def test_recognize_by_photo_loads_the_adapter_on_demand(monkeypatch, tmp_path):
+    """A photo question is useful with no camera running, so it waits for the
+    single-flight load rather than reporting `loading` and making callers poll."""
+    plugin, executor, builder = _photo_plugin(monkeypatch, tmp_path)
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"hello-world")
+
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": str(photo)})
+    assert result["ok"] is True
+    assert result["source"] == str(photo)
+    # The stubbed adapter echoes the bytes back as the recognised text, so this
+    # also proves the image reached it intact.
+    assert result["items"][0]["text"] == "hello-world"
+    assert executor.nodes == []          # nothing was started
+    assert builder.calls == 1
+
+
+def test_recognize_reuses_the_adapter_a_running_instance_already_built(monkeypatch, tmp_path):
+    """One adapter, not a second set of TensorRT engines on the same GPU."""
+    plugin, executor, builder = _photo_plugin(monkeypatch, tmp_path)
+    _start_and_wait(plugin, executor, "/cam/a")
+    assert builder.calls == 1
+
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"abc")
+    assert plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                   "image_path": str(photo)})["ok"] is True
+    assert builder.calls == 1
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_recognize_by_photo_refuses_a_path_outside_the_roots(monkeypatch, tmp_path):
+    plugin, _, _ = _photo_plugin(monkeypatch, tmp_path)
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": "/etc/passwd"})
+    assert result["ok"] is False
+    assert result["reason"] == "bad_input"
+    assert "recognize_by_url" in result["detail"]
+
+
+def test_recognize_by_url_shares_the_photo_path(monkeypatch, tmp_path):
+    import plugins.image_input as image_input
+    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: b"from-url")
+    plugin, _, _ = _photo_plugin(monkeypatch, tmp_path)
+    result = plugin.dispatch("ocr", {"action": "recognize_by_url",
+                                     "url": "https://example.com/doc.jpg"})
+    assert result["ok"] is True
+    assert result["source"] == "https://example.com/doc.jpg"
+    assert result["items"][0]["text"] == "from-url"
+
+
+def test_recognize_surfaces_an_adapter_load_failure(monkeypatch, tmp_path):
+    def explode(cfg, on_status=None):
+        raise RuntimeError("no engines")
+
+    cfg = {"provider": "rapidocr", "image_roots": [str(tmp_path)]}
+    plugin, _, _ = _make_plugin(monkeypatch, builder=explode, cfg=cfg)
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"x")
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": str(photo)})
+    assert result["ok"] is False
+    assert result["reason"] == "adapter_unavailable"
+    assert "no engines" in result["detail"]
+
+
+def test_the_new_ocr_actions_are_advertised(monkeypatch, tmp_path):
+    schema = ocr_plugin.TOOLS[0]["inputSchema"]
+    assert {"recognize_by_photo", "recognize_by_url"} <= set(
+        schema["properties"]["action"]["enum"])
+    assert schema["x-action-params"]["recognize_by_photo"]["params"] == ["image_path"]
+    assert schema["properties"]["image_path"]["uploadTo"] == "mcp"
+
+
+def test_start_without_a_topic_comes_up_on_demand(ocr):
+    """A card with no camera still starts, as tts's does.
+
+    It loads the adapter and owns a publisher; it just has nothing to subscribe
+    to. Before this it raised, so a photo-only card could never show `running`.
+    """
+    plugin, executor, _ = ocr
+    plugin.dispatch("ocr", {"action": "start"})
+    assert _wait_until(lambda: len(executor.nodes) == 1
+                       and executor.nodes[0].state == "running")
+    node = executor.nodes[0]
+    assert node._input_topic == ""
+    assert node._output_topic == ocr_plugin.DEFAULT_OUTPUT_TOPIC
+    assert node.subscriptions == []          # nothing to subscribe to
+    assert set(plugin._nodes) == {"_default"}
