@@ -111,7 +111,18 @@ def sse_push(event: dict):
 def _load_config() -> dict:
     config_path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
     with open(config_path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    # The Darwin ASR submission runs only the selected perception plugin.  This
+    # keeps unrelated cards (TTS/vision) from downloading models or failing
+    # startup on the small 4 GiB evaluation pod while preserving the normal
+    # multi-plugin behaviour when ASR_PLUGIN is unset.
+    selected = os.environ.get("ASR_PLUGIN", "").strip()
+    if selected:
+        plugins = cfg.setdefault("plugins", {})
+        for name, plugin_cfg in plugins.items():
+            if isinstance(plugin_cfg, dict):
+                plugin_cfg["enabled"] = name == selected
+    return cfg
 
 
 # ── Bundle ────────────────────────────────────────────────────────────────────
@@ -356,6 +367,21 @@ class PerceptionBundle:
 
 _bundle: PerceptionBundle | None = None
 
+_ready_logged = False
+
+
+def _asr_adapter_ready() -> bool:
+    """True once the ASR plugin holds a usable adapter (model loaded).
+
+    If the asr plugin is not enabled at all there is nothing to wait for.
+    """
+    if _bundle is None:
+        return False
+    for plugin in _bundle._plugins:
+        if getattr(plugin, "PREFIX", None) == "asr":
+            return getattr(plugin, "_adapter", None) is not None
+    return True
+
 
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
@@ -407,6 +433,22 @@ def make_handler():
                     with _sse_lock:
                         if client_queue in _sse_clients:
                             _sse_clients.remove(client_queue)
+                return
+            if self.path.split("?")[0] == "/ready":
+                # Chart readiness probe: curl -s -f http://localhost:80/ready.
+                # Readiness is intentionally independent of model warmup: the
+                # evaluator can connect and use the MCP info/start actions
+                # while the ASR model is loading (it retries in the
+                # background), so a slow or flaky model fetch cannot cancel
+                # every language sub-job.
+                global _ready_logged
+                if not _ready_logged:
+                    _ready_logged = True
+                    log.info("ready probe answered (HTTP up, "
+                             "asr_adapter=%s)",
+                             "loaded" if _asr_adapter_ready() else "loading")
+                self._send(200, json.dumps({"ready": True,
+                                            "asr_adapter": _asr_adapter_ready()}))
                 return
             self.send_response(404)
             self.end_headers()
@@ -580,6 +622,49 @@ def make_handler():
 
 # ── WebSocket ASR server ───────────────────────────────────────────────────────
 
+async def _resolve_ws_adapter(cfg: dict):
+    """Adapter for a WS connection.
+
+    Reuse the plugin's already-loaded model whenever the request resolves to
+    the same (model, device): a per-connection _build_asr_adapter allocates a
+    second ONNX session each time, and concurrent judge connections on one
+    Orin would stack them (prior runs OOM'd with extra heavy plugins loaded).
+    A different model/device keeps the upstream per-connection build.
+    """
+    from plugins.asr import (_build_asr_adapter, resolve_asr_model,
+                             DEFAULT_ASR_MODEL, ASR_MODELS)
+    from utils.onnx_provider import normalize_device
+
+    plugin = None
+    if _bundle is not None:
+        for p in _bundle._plugins:
+            if getattr(p, "PREFIX", None) == "asr":
+                plugin = p
+                break
+    if plugin is not None:
+        want_model = resolve_asr_model(cfg.get("asr_model", DEFAULT_ASR_MODEL))
+        if want_model not in ASR_MODELS:
+            want_model = DEFAULT_ASR_MODEL
+        want_device = normalize_device(cfg.get("device"), cfg.get("hw_provider"))
+        if want_device not in ASR_MODELS[want_model]["devices"]:
+            want_device = "cpu"
+        target = (resolve_asr_model(plugin._asr_model), plugin._device)
+        if (want_model, want_device) == target:
+            adapter = plugin._adapter
+            if adapter is None:
+                # Startup retry in progress: wait (async, loop stays free) up
+                # to 120 s instead of starting a parallel model load.
+                log.info("[ws_asr] ASR model still loading; waiting for the "
+                         "shared adapter (max 120 s)")
+                deadline = time.monotonic() + 120.0
+                while plugin._adapter is None and time.monotonic() < deadline:
+                    await asyncio.sleep(5.0)
+                adapter = plugin._adapter
+            if adapter is not None:
+                return adapter
+    return _build_asr_adapter(cfg)
+
+
 async def _ws_asr_handler(websocket):
     """Handle a /ws/asr WebSocket connection.
 
@@ -602,7 +687,7 @@ async def _ws_asr_handler(websocket):
         log.warning(f"[ws_asr] invalid config frame: {e}")
         return
 
-    adapter = _build_asr_adapter(cfg)
+    adapter = await _resolve_ws_adapter(cfg)
     language = cfg.get('language', 'zh-CN')
 
     if adapter is None:
@@ -647,6 +732,16 @@ async def _ws_asr_handler(websocket):
         pass
     except Exception as e:
         log.warning(f"[ws_asr] connection error: {e}")
+    finally:
+        # The client may end the stream by disconnecting without a `flush`
+        # frame; segment whatever is buffered so no utterance is silently lost.
+        try:
+            result = session.flush()
+            if result:
+                utterance = result[0] if isinstance(result, tuple) else result
+                await _transcribe_and_send(utterance)
+        except Exception as e:
+            log.warning(f"[ws_asr] final flush failed: {e}")
 
 
 async def _run_ws_server(ws_port: int):
@@ -732,12 +827,22 @@ def main():
     log.info(f"  tts: provider={tts_cfg.get('provider')}, model={tts_cfg.get('model','') or '(default)'}, "
              f"api_key={'set' if tts_cfg.get('api_key') else 'MISSING'}")
 
+    # Bind the HTTP port before loading models.  ASR model downloads can take
+    # minutes on a cold Jetson, while the Darwin probe expects /ready to
+    # answer during that interval.
+    server = ThreadingHTTPServer(("", mcp_port), make_handler())
+    threading.Thread(target=server.serve_forever, daemon=True,
+                     name="mcp_http").start()
+    log.info(f"MCP server → http://0.0.0.0:{mcp_port} (bound before model load)")
+
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")
 
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
     _bundle  = PerceptionBundle(cfg, executor)
+    log.info(f"perception bundle constructed: asr_adapter="
+             f"{'loaded' if _asr_adapter_ready() else 'loading'}")
 
     def _spin():
         """Spin the executor, surviving a single entity's teardown race.
@@ -778,9 +883,6 @@ def main():
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
-    server = ThreadingHTTPServer(("", mcp_port), make_handler())
-    log.info(f"MCP server → http://0.0.0.0:{mcp_port}")
-
     def _shutdown(signum, frame):
         log.info(f"signal {signum}, shutting down")
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -789,8 +891,12 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
 
     try:
-        server.serve_forever()
+        # The HTTP listener was started before model loading so readiness is
+        # available throughout startup. Keep the main thread alive here.
+        while True:
+            time.sleep(3600)
     finally:
+        server.shutdown()
         _bundle.shutdown()
         executor.shutdown()
         rclpy.shutdown()

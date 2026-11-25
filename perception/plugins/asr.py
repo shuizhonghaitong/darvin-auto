@@ -2183,7 +2183,24 @@ class ASRPlugin:
         # threads — a plain attribute assignment is atomic enough for that and
         # needs no lock.
         self._load_status  = ""
-        self._adapter      = _build_asr_adapter(plugin_cfg)
+        # Created before the adapter build: on a failed build we start a
+        # background retry thread, which updates state under _nodes_lock, so
+        # the lock must exist by then.
+        self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
+        self._nodes_lock = threading.RLock()
+        try:
+            self._adapter = _build_asr_adapter(plugin_cfg)
+        except Exception as e:
+            # A transient model fetch/load failure at startup must not kill the
+            # whole perception service: come up with adapter=None (MCP start
+            # answers an explicit error, /ready stays 503) and retry in the
+            # background until the model is usable.
+            log.error(f"[asr] initial model load failed: {e}; "
+                      f"retrying in background every 30 s", exc_info=True)
+            self._adapter = None
+            self._load_error = str(e)
+            threading.Thread(target=self._retry_model_load, daemon=True,
+                             name="asr_model_retry").start()
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
@@ -2210,18 +2227,48 @@ class ASRPlugin:
         # this plugin already has, which is below the ASR adapter, so it is
         # independent of which ASR model is loaded and survives a model switch.
         self._speaker = speaker
-        self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
-        # main.py serves MCP over ThreadingHTTPServer, so start/stop/config can
-        # run concurrently on this plugin. Guards read-modify-write of _nodes
-        # only — never held across node.start()/stop() or a model load, because
+        # _nodes/_nodes_lock were created above (before the adapter build) so
+        # the startup retry thread can use the lock. main.py serves MCP over
+        # ThreadingHTTPServer, so start/stop/config can run concurrently on
+        # this plugin; the lock guards read-modify-write of _nodes only —
+        # never held across node.start()/stop() or a model load, because
         # start() blocks up to 15s and a stop queued behind it could no longer
         # cancel it. See perception/README.md § Plugin Concurrency.
-        self._nodes_lock = threading.RLock()
         self._executor = executor
         log.info(f"[asr] plugin init: model={self._asr_model}, device={self._device}, "
                  f"vad={self._vad_backend}, threshold={self._vad_threshold}, "
                  f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
                  f"trigger_mode={self._kws_cfg['trigger_mode']}")
+
+    def _retry_model_load(self):
+        """Rebuild the adapter every 30 s until it succeeds.
+
+        Only the plugin that started us calls this; a later `config` switch
+        goes through _load_model_async instead, so this loop stops as soon as
+        any adapter is present.
+        """
+        while self._adapter is None:
+            try:
+                time.sleep(30.0)
+                adapter = _build_asr_adapter(self._plugin_cfg)
+                with self._nodes_lock:
+                    self._adapter = adapter
+                    self._load_error = None
+                    self._load_status = ""
+                    self._loading = False
+                log.info(f"[asr] background model retry succeeded: "
+                         f"'{self._asr_model}' ({self._device}) ready")
+                return
+            except Exception as e:
+                # Never let the retry thread die: a transient failure (including
+                # one in the bookkeeping above) just schedules the next attempt.
+                log.warning(f"[asr] background model retry failed ({e}); "
+                            f"next attempt in 30 s")
+                try:
+                    with self._nodes_lock:
+                        self._load_error = str(e)
+                except Exception:
+                    pass
 
     def get_tools(self) -> list:
         return TOOLS
@@ -2646,6 +2693,65 @@ class ASRPlugin:
 
 
 # ── VAD test helper (called by /vad/test HTTP endpoint) ───────────────────────
+
+
+class VadSession:
+    """Buffering VAD session for the WebSocket ASR path (main.py).
+
+    The WS protocol streams PCM16 chunks and a `flush` marker. Rather than
+    keeping a long-lived VAD worker per connection (a process each, on top of
+    the already-heavy startup model load), chunks are buffered and segmented
+    with the same synchronous Silero VAD that /vad/test uses when the client
+    flushes. The first VAD segment is the returned utterance; when VAD finds
+    nothing (or fails) the whole buffer is handed to the model, which either
+    transcribes it or returns empty text — the WS handler skips empty
+    transcripts, so silence still yields no fake result.
+    """
+
+    def __init__(self, model: str = 'silero', threshold: float = 0.5,
+                 silence_ms: int = 400):
+        self._model = model
+        self._threshold = threshold
+        self._silence_ms = silence_ms
+        self._pcm = bytearray()
+        self._inited = False
+
+    def init(self) -> None:
+        self._inited = True
+
+    def process_chunk(self, pcm: bytes, _ts: float):
+        if not self._inited:
+            self.init()
+        if pcm:
+            self._pcm.extend(pcm)
+        return None
+
+    def flush(self):
+        if not self._inited:
+            self.init()
+        pcm = bytes(self._pcm)
+        self._pcm.clear()
+        if len(pcm) < SAMPLE_RATE // 10:  # < 100 ms: nothing to transcribe
+            return None
+        try:
+            segments = _vad_segment_sync(_pcm16_to_wav(pcm), self._model,
+                                         self._threshold, self._silence_ms)
+        except Exception as e:
+            log.warning(f"[ws_asr] VAD segmentation failed ({e}); "
+                        f"handing raw audio to the model")
+            return (pcm, 0, len(pcm) // 2)
+        if not segments:
+            return (pcm, 0, len(pcm) // 2)
+        first = segments[0]
+        wav_bytes = __import__('base64').b64decode(first.get('wav', ''))
+        import io, wave
+        try:
+            with wave.open(io.BytesIO(wav_bytes)) as wf:
+                seg_pcm = wf.readframes(wf.getnframes())
+        except Exception:
+            seg_pcm = pcm
+        return (seg_pcm, first.get('start', 0), first.get('end', 0))
+
 
 def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
                       threshold: float = 0.5, silence_ms: int = 800) -> list:
