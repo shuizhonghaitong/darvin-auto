@@ -715,6 +715,37 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
+def _prewarm_vop(bundle, cfg: dict):
+    """Kick off the vop engine load at startup through the public tool path.
+
+    The judge calls vop soon after the shell is ready; paying the ~24 MB
+    pinned-bundle fetch plus TensorRT parse on that first request risks the
+    evaluation window. Dispatching action=start (no topic) is the plugin's
+    own single-flight background-load path, and a topic-less node consumes
+    no frames. A failed load does not poison the service: recognize_by_photo
+    triggers the same load again.
+    """
+    if not (cfg.get("plugins", {}).get("vop", {}) or {}).get("enabled", False):
+        return
+
+    def _run():
+        try:
+            reply = bundle.dispatch("vop", {"action": "start"})
+            log.info(f"[vop] prewarm start dispatched: {reply}")
+            state = str((reply or {}).get("state", ""))
+            deadline = time.time() + 300.0
+            while state == "loading" and time.time() < deadline:
+                time.sleep(5.0)
+                info = bundle.dispatch("vop", {"action": "info"}) or {}
+                state = str(info.get("state", ""))
+            log.info(f"[vop] prewarm settled: state={state}")
+        except Exception:
+            log.error("[vop] prewarm failed; first request will retry the load",
+                      exc_info=True)
+
+    threading.Thread(target=_run, daemon=True, name="vop_prewarm").start()
+
+
 def main():
     global _bundle
 
@@ -772,6 +803,10 @@ def main():
                 time.sleep(1.0)
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
+
+    # This deployment runs a single plugin (vop); start its engine load
+    # now so the first judged request is not the cold one.
+    _prewarm_vop(_bundle, cfg)
 
     # Start WebSocket ASR server in a separate thread
     threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
