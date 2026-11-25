@@ -42,31 +42,16 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import String
-
-from utils.ros_lifecycle import dispose_node
 
 from plugins.image_input import BadInput, load_image_bytes
 
+# ROS2 (rclpy / FastRTPS / sensor_msgs) is imported LAZILY by _ros_node_class()
+# only when a camera topic is actually started. The Darwin VOP subnet runs this
+# service lean: topic-less recognize_by_photo / recognize_by_url only, and
+# importing rclpy would cost every concurrent instance several hundred MB of
+# unified memory on the shared Orin box (multi-instance OOM, exit 137).
+
 log = logging.getLogger(__name__)
-
-_LOW_LAT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=2,
-    durability=DurabilityPolicy.VOLATILE,
-)
-
-_PUB_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=10,
-    durability=DurabilityPolicy.VOLATILE,
-)
 
 # Where a topic-less card publishes. Fixed, because with no input topic
 # there is nothing to derive it from — same rule as tts's /perception/tts.
@@ -195,13 +180,17 @@ def color_stats(frame_bgr, bbox=None) -> dict:
     panel is bright *and* flat); ``hsv_mean[2]`` is the raw brightness a
     lights-on check reads.
     """
-    import cv2
+    from plugins.vision_runtime import _no_cv2, bgr_to_hsv_cv
 
     region = _region(frame_bgr, bbox)
     if region is None:
         return {}
     rgb = region[:, :, ::-1].reshape(-1, 3).astype(np.float32)
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+    if _no_cv2():
+        hsv = bgr_to_hsv_cv(region).reshape(-1, 3)
+    else:
+        import cv2
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
     rgb_mean, rgb_var = rgb.mean(axis=0), rgb.var(axis=0)
     hsv_mean, hsv_var = hsv.mean(axis=0), hsv.var(axis=0)
     h, sat, val = (float(v) for v in hsv_mean)
@@ -268,14 +257,17 @@ def color_block(frame_bgr, bbox, level: str) -> dict:
     if level == "full":
         return {"color": color_stats(frame_bgr, bbox)}
 
-    import cv2
+    from plugins.vision_runtime import _no_cv2, bgr_to_hsv_cv
 
     region = _region(frame_bgr, bbox)
     if region is None:
         return {}
-    h, s, v = (float(x) for x in
-               cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-                  .reshape(-1, 3).astype(np.float32).mean(axis=0))
+    if _no_cv2():
+        hsv = bgr_to_hsv_cv(region).reshape(-1, 3)
+    else:
+        import cv2
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+    h, s, v = (float(x) for x in hsv.mean(axis=0))
     return {"color": color_triple(h, s, v), "brightness": round(v, 1)}
 
 
@@ -375,211 +367,248 @@ TOOLS = [
 
 # ── ROS2 Node (one per instance/topic) ────────────────────────────────────────
 
-class _VOPNode(Node):
-    """Per-topic YOLO inference node."""
+def _ros_node_class():
+    """Build (once) the per-topic ROS2 node class, importing rclpy lazily.
 
-    def __init__(self, input_topic: Optional[str], model, confidence: float, fps: float,
-                 node_suffix: str, vocabulary: Optional[list] = None,
-                 publish_bbox: bool = True, publish_color: str = "name"):
-        super().__init__(f"vop_{node_suffix}" if node_suffix else "vop")
-        # Topic-less is a supported mode, as in plugins/tts.py: a card driven
-        # only by recognize_by_photo has no camera to subscribe to, but still
-        # wants somewhere to publish so the canvas shows the flow. The fallback
-        # output is fixed because there is no input topic to derive it from.
-        self._input_topic = input_topic or ''
-        self._output_topic = output_topic_for(input_topic)
-        self._model = model
-        self._vocabulary = list(vocabulary or [])
-        self._confidence = confidence
-        self._fps = fps
-        self._publish_bbox = bool(publish_bbox)
-        self._publish_color = publish_color if publish_color in COLOR_LEVELS else "name"
-        self._frame_interval = 1.0 / max(fps, 0.1)
+    The class body is the reference `_VOPNode`, unchanged except that the two
+    QoS profiles are local to this closure. Everything a camera topic needs —
+    the ROS import, the DDS runtime, the per-node worker — stays out of a lean
+    recognize-only deployment, which is what the Darwin VOP subnet runs.
+    """
+    global _ROS_NODE_CLASS
+    if _ROS_NODE_CLASS is not None:
+        return _ROS_NODE_CLASS
+    import rclpy  # noqa: F401
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage
+    from std_msgs.msg import String
 
-        self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
-        self._sub: Optional[object] = None
-        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
-        self._stop_event = threading.Event()
-        self._worker: Optional[threading.Thread] = None
-        self._last_inference_time = 0.0
-        self._detect_count = 0
-        self._running = False
-        # Serializes start/stop on this node. The plugin calls both from HTTP
-        # handler threads, and the canvas routinely does config→start→stop→start
-        # within seconds; without this two starts can both pass the running
-        # check and the second overwrites the first's subscription, orphaning a
-        # live worker nothing can stop. Same rule as plugins/ocr.py.
-        self._lifecycle_lock = threading.RLock()
+    low_lat_qos = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=2,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+    pub_qos = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10,
+        durability=DurabilityPolicy.VOLATILE,
+    )
 
-    def request_stop(self) -> None:
-        """Signal the worker to wind down without taking the lifecycle lock.
+    class _VOPNodeROS(Node):
+        """Per-topic YOLO inference node."""
 
-        stop() has to be able to cancel a start() that is still in progress, so
-        the cancellation flag must be settable while that start holds the lock.
-        """
-        self._stop_event.set()
+        def __init__(self, input_topic: Optional[str], model, confidence: float, fps: float,
+                     node_suffix: str, vocabulary: Optional[list] = None,
+                     publish_bbox: bool = True, publish_color: str = "name"):
+            super().__init__(f"vop_{node_suffix}" if node_suffix else "vop")
+            # Topic-less is a supported mode, as in plugins/tts.py: a card driven
+            # only by recognize_by_photo has no camera to subscribe to, but still
+            # wants somewhere to publish so the canvas shows the flow. The fallback
+            # output is fixed because there is no input topic to derive it from.
+            self._input_topic = input_topic or ''
+            self._output_topic = output_topic_for(input_topic)
+            self._model = model
+            self._vocabulary = list(vocabulary or [])
+            self._confidence = confidence
+            self._fps = fps
+            self._publish_bbox = bool(publish_bbox)
+            self._publish_color = publish_color if publish_color in COLOR_LEVELS else "name"
+            self._frame_interval = 1.0 / max(fps, 0.1)
 
-    def _status(self) -> dict:
-        return {
-            "state": "running" if self._running else "idle",
-            "input": self._input_topic,
-            "output": self._output_topic,
-            "mode": "stream" if self._input_topic else "on_demand",
-        }
-
-    def start(self) -> dict:
-        with self._lifecycle_lock:
-            if self._running:
-                return self._status()
-            self._stop_event.clear()
-            if self._input_topic and self._sub is None:
-                self._sub = self.create_subscription(
-                    CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
-                )
-                self._worker = threading.Thread(target=self._inference_worker, daemon=True,
-                                                name=f"vop_worker_{self._input_topic}")
-                self._worker.start()
-            # Without a topic there is nothing to subscribe to and no frames to
-            # consume, so no worker is spawned; the node exists to own the
-            # publisher that one-shot results go out on.
-            self._running = True
-            log.info(f"[vop] started: {self._input_topic or '(no topic, on-demand)'} "
-                     f"→ {self._output_topic}")
-            return self._status()
-
-    def stop(self) -> dict:
-        """Stop this node's worker. Does NOT touch the subscription.
-
-        Destroying a subscription while the node is still registered with the
-        executor races the executor's own wait list and kills the spin thread
-        with `InvalidHandle: cannot use Destroyable because destruction was
-        requested` — which takes every subscription in the process with it,
-        silently, because nothing catches it. The subscription is torn down by
-        destroy_node() in utils.ros_lifecycle.dispose_node, after the node has
-        been removed from the executor. Same order plugins/ocr.py uses.
-        """
-        # Flag first, lock second: a start() holding the lock will see the flag
-        # as soon as it releases, instead of this call queueing behind it.
-        self._stop_event.set()
-        with self._lifecycle_lock:
-            if self._worker and self._worker.is_alive():
-                self._worker.join(timeout=3.0)
-            self._worker = None
+            self._pub = self.create_publisher(String, self._output_topic, pub_qos)
+            self._sub: Optional[object] = None
+            self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
+            self._stop_event = threading.Event()
+            self._worker: Optional[threading.Thread] = None
+            self._last_inference_time = 0.0
+            self._detect_count = 0
             self._running = False
-            log.info(f"[vop] stopped: {self._input_topic or '(no topic)'}")
-            return self._status()
+            # Serializes start/stop on this node. The plugin calls both from HTTP
+            # handler threads, and the canvas routinely does config→start→stop→start
+            # within seconds; without this two starts can both pass the running
+            # check and the second overwrites the first's subscription, orphaning a
+            # live worker nothing can stop. Same rule as plugins/ocr.py.
+            self._lifecycle_lock = threading.RLock()
 
-    def _image_cb(self, msg: CompressedImage):
-        now = time.monotonic()
-        if now - self._last_inference_time < self._frame_interval:
-            return
-        self._last_inference_time = now
-        # Drop old frame if queue full (no backpressure)
-        try:
-            self._frame_queue.put_nowait(msg.data)
-        except queue.Full:
-            try:
-                self._frame_queue.get_nowait()
-            except queue.Empty:
-                pass
+        def request_stop(self) -> None:
+            """Signal the worker to wind down without taking the lifecycle lock.
+
+            stop() has to be able to cancel a start() that is still in progress, so
+            the cancellation flag must be settable while that start holds the lock.
+            """
+            self._stop_event.set()
+
+        def _status(self) -> dict:
+            return {
+                "state": "running" if self._running else "idle",
+                "input": self._input_topic,
+                "output": self._output_topic,
+                "mode": "stream" if self._input_topic else "on_demand",
+            }
+
+        def start(self) -> dict:
+            with self._lifecycle_lock:
+                if self._running:
+                    return self._status()
+                self._stop_event.clear()
+                if self._input_topic and self._sub is None:
+                    self._sub = self.create_subscription(
+                        CompressedImage, self._input_topic, self._image_cb, low_lat_qos
+                    )
+                    self._worker = threading.Thread(target=self._inference_worker, daemon=True,
+                                                    name=f"vop_worker_{self._input_topic}")
+                    self._worker.start()
+                # Without a topic there is nothing to subscribe to and no frames to
+                # consume, so no worker is spawned; the node exists to own the
+                # publisher that one-shot results go out on.
+                self._running = True
+                log.info(f"[vop] started: {self._input_topic or '(no topic, on-demand)'} "
+                         f"→ {self._output_topic}")
+                return self._status()
+
+        def stop(self) -> dict:
+            """Stop this node's worker. Does NOT touch the subscription.
+
+            Destroying a subscription while the node is still registered with the
+            executor races the executor's own wait list and kills the spin thread
+            with `InvalidHandle: cannot use Destroyable because destruction was
+            requested` — which takes every subscription in the process with it,
+            silently, because nothing catches it. The subscription is torn down by
+            destroy_node() in utils.ros_lifecycle.dispose_node, after the node has
+            been removed from the executor. Same order plugins/ocr.py uses.
+            """
+            # Flag first, lock second: a start() holding the lock will see the flag
+            # as soon as it releases, instead of this call queueing behind it.
+            self._stop_event.set()
+            with self._lifecycle_lock:
+                if self._worker and self._worker.is_alive():
+                    self._worker.join(timeout=3.0)
+                self._worker = None
+                self._running = False
+                log.info(f"[vop] stopped: {self._input_topic or '(no topic)'}")
+                return self._status()
+
+        def _image_cb(self, msg: CompressedImage):
+            now = time.monotonic()
+            if now - self._last_inference_time < self._frame_interval:
+                return
+            self._last_inference_time = now
+            # Drop old frame if queue full (no backpressure)
             try:
                 self._frame_queue.put_nowait(msg.data)
             except queue.Full:
-                pass
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._frame_queue.put_nowait(msg.data)
+                except queue.Full:
+                    pass
 
-    def _inference_worker(self):
-        import cv2
-        from plugins.vision_runtime import decode_detections
+        def _inference_worker(self):
+            import cv2
+            from plugins.vision_runtime import decode_detections
 
-        while not self._stop_event.is_set():
-            try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            started = time.time()
-            try:
-                frame = cv2.imdecode(
-                    np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
-                )
-                if frame is None:
+            while not self._stop_event.is_set():
+                try:
+                    jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                except queue.Empty:
                     continue
-                outputs, meta = self._model.infer(frame)
-                boxes, scores, classes = decode_detections(
-                    outputs, meta, self._confidence
-                )
-                objects = self._extract_objects(boxes, scores, classes, frame)
-                self._publish_objects(objects, started)
-            except Exception as e:
-                log.error(f"[vop] inference error: {e}", exc_info=True)
+                started = time.time()
+                try:
+                    frame = cv2.imdecode(
+                        np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
+                    )
+                    if frame is None:
+                        continue
+                    outputs, meta = self._model.infer(frame)
+                    boxes, scores, classes = decode_detections(
+                        outputs, meta, self._confidence
+                    )
+                    objects = self._extract_objects(boxes, scores, classes, frame)
+                    self._publish_objects(objects, started)
+                except Exception as e:
+                    log.error(f"[vop] inference error: {e}", exc_info=True)
 
-    def _class_name(self, cls_id: int) -> str:
-        """Resolve a class id through the engine's frozen vocabulary.
+        def _class_name(self, cls_id: int) -> str:
+            """Resolve a class id through the engine's frozen vocabulary.
 
-        vocab.json is written by the exporter from the same list, in the same
-        order, that was baked into the weights. An id outside it stays numeric
-        rather than becoming a confidently wrong word.
-        """
-        if 0 <= cls_id < len(self._vocabulary):
-            return self._vocabulary[cls_id]
-        return str(cls_id)
+            vocab.json is written by the exporter from the same list, in the same
+            order, that was baked into the weights. An id outside it stays numeric
+            rather than becoming a confidently wrong word.
+            """
+            if 0 <= cls_id < len(self._vocabulary):
+                return self._vocabulary[cls_id]
+            return str(cls_id)
 
-    def _extract_objects(self, boxes, scores, classes, frame) -> list:
-        # `frame` is the decoded BGR array; a bare shape tuple is still
-        # accepted (older callers and tests) and just yields no colour.
-        pixels = frame if hasattr(frame, "shape") else None
-        H, W = (pixels.shape if pixels is not None else frame)[:2]
-        half_w, half_h = W / 2.0, H / 2.0
-        objects = []
-        for (x1, y1, x2, y2), score, cls_id in zip(boxes, scores, classes):
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            obj = {
-                "name": self._class_name(int(cls_id)),
-                "position": [
-                    round(float((cx - half_w) / half_w), 3),
-                    round(float((cy - half_h) / half_h), 3),
-                ],
-                "confidence": round(float(score), 2),
+        def _extract_objects(self, boxes, scores, classes, frame) -> list:
+            # `frame` is the decoded BGR array; a bare shape tuple is still
+            # accepted (older callers and tests) and just yields no colour.
+            pixels = frame if hasattr(frame, "shape") else None
+            H, W = (pixels.shape if pixels is not None else frame)[:2]
+            half_w, half_h = W / 2.0, H / 2.0
+            objects = []
+            for (x1, y1, x2, y2), score, cls_id in zip(boxes, scores, classes):
+                cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                obj = {
+                    "name": self._class_name(int(cls_id)),
+                    "position": [
+                        round(float((cx - half_w) / half_w), 3),
+                        round(float((cy - half_h) / half_h), 3),
+                    ],
+                    "confidence": round(float(score), 2),
+                }
+                if self._publish_bbox:
+                    # The pixel box, which this loop has had all along and used to
+                    # throw away after computing the colour from it. A consumer that
+                    # wants to sample another aligned map (a depth frame, say) over
+                    # the object can only do it properly with the box: a centre point
+                    # gives it one small patch and no idea how big the thing is.
+                    obj["bbox"] = [round(float(v), 1) for v in (x1, y1, x2, y2)]
+                if pixels is not None:
+                    # Colour of the box, so "the red ball" is answerable without
+                    # the model ever seeing pixels. Level-dependent — see color_block.
+                    obj.update(color_block(pixels, (x1, y1, x2, y2), self._publish_color))
+                objects.append(obj)
+            return objects
+
+        def publish_objects(self, objects: list, started: Optional[float] = None):
+            """Publish a detection payload. Used by the stream worker and by
+            the one-shot photo actions, so both emit the same thing."""
+            self._publish_objects(objects, started)
+
+        def _publish_objects(self, objects: list, started: Optional[float] = None):
+            self._detect_count += 1
+            # `count` and `latency_ms` follow plugins/face.py: a consumer should not
+            # have to len() the list to know whether anything was seen, and latency
+            # is the number an operator actually watches. `timestamp` keeps its name
+            # rather than becoming face's `ts` — renaming it would break every
+            # existing reader of {topic}/objects for no gain.
+            payload = {
+                "timestamp": time.time(),
+                "count": len(objects),
+                "objects": objects,
             }
-            if self._publish_bbox:
-                # The pixel box, which this loop has had all along and used to
-                # throw away after computing the colour from it. A consumer that
-                # wants to sample another aligned map (a depth frame, say) over
-                # the object can only do it properly with the box: a centre point
-                # gives it one small patch and no idea how big the thing is.
-                obj["bbox"] = [round(float(v), 1) for v in (x1, y1, x2, y2)]
-            if pixels is not None:
-                # Colour of the box, so "the red ball" is answerable without
-                # the model ever seeing pixels. Level-dependent — see color_block.
-                obj.update(color_block(pixels, (x1, y1, x2, y2), self._publish_color))
-            objects.append(obj)
-        return objects
+            if started is not None:
+                # Measured from the start of processing this frame, not from its
+                # arrival: queue wait is a function of the fps cap, not of how long
+                # detection takes, and mixing them makes the number unreadable.
+                payload["latency_ms"] = int((time.time() - started) * 1000)
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self._pub.publish(msg)
 
-    def publish_objects(self, objects: list, started: Optional[float] = None):
-        """Publish a detection payload. Used by the stream worker and by
-        the one-shot photo actions, so both emit the same thing."""
-        self._publish_objects(objects, started)
 
-    def _publish_objects(self, objects: list, started: Optional[float] = None):
-        self._detect_count += 1
-        # `count` and `latency_ms` follow plugins/face.py: a consumer should not
-        # have to len() the list to know whether anything was seen, and latency
-        # is the number an operator actually watches. `timestamp` keeps its name
-        # rather than becoming face's `ts` — renaming it would break every
-        # existing reader of {topic}/objects for no gain.
-        payload = {
-            "timestamp": time.time(),
-            "count": len(objects),
-            "objects": objects,
-        }
-        if started is not None:
-            # Measured from the start of processing this frame, not from its
-            # arrival: queue wait is a function of the fps cap, not of how long
-            # detection takes, and mixing them makes the number unreadable.
-            payload["latency_ms"] = int((time.time() - started) * 1000)
-        msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=False)
-        self._pub.publish(msg)
 
+    _ROS_NODE_CLASS = _VOPNodeROS
+    return _ROS_NODE_CLASS
+
+
+_ROS_NODE_CLASS: Optional[type] = None
 
 # ── Plugin class ──────────────────────────────────────────────────────────────
 
@@ -606,7 +635,7 @@ class VideoObjectPerceptionPlugin:
         # cold start reports how far along it is instead of a fixed sentence.
         self._model_load_status = None
         self._model_lock = threading.Lock()
-        self._nodes: dict[str, _VOPNode] = {}
+        self._nodes: dict = {}
         self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
         # What the camera feeding each instance said about its optics
         # (`motus.camera/1`, arrives as `camera_info` on `start`). vop's
@@ -647,6 +676,19 @@ class VideoObjectPerceptionPlugin:
         unknown vocabulary until then.
         """
         try:
+            # Lean deployment: the vocabulary ships with the baked ONNX — read
+            # it locally, no download, before the first request.
+            from plugins.vop_light_runtime import light_path_enabled
+            if light_path_enabled():
+                from plugins import vop_light_runtime
+                if vop_light_runtime.find_onnx():
+                    names = vop_light_runtime.find_vocab()
+                    if names and not self._vocabulary:
+                        self._vocabulary = names
+                        log.info(f"[vop] vocabulary from baked model: "
+                                 f"{len(names)} classes")
+                    return
+
             from utils.model_downloader import (
                 VOP_MODEL_BUNDLES, ensure_verified_bundle, require_models_subpath,
                 select_bundle_family,
@@ -703,30 +745,36 @@ class VideoObjectPerceptionPlugin:
             # utils.tensorrt_runtime. Only the cv2 repair below still matters,
             # because the decode and letterbox use it.
 
-            # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
-            # and patch missing imshow for headless environments
-            try:
-                import cv2
-                # Test if cv2 is functional
-                _ = cv2.IMREAD_COLOR
-            except (ImportError, AttributeError):
-                import importlib.util, sys as _sys
-                import glob as _glob
-                # Find the .so directly
-                _so_candidates = _glob.glob("/usr/lib/python*/dist-packages/cv2/python-*/cv2.cpython-*.so")
-                if _so_candidates:
-                    _spec = importlib.util.spec_from_file_location("cv2", _so_candidates[0])
-                    _mod = importlib.util.module_from_spec(_spec)
-                    _spec.loader.exec_module(_mod)
-                    _sys.modules["cv2"] = _mod
-                    import cv2
-                else:
-                    import cv2  # let it fail naturally
+            from plugins.vision_runtime import _no_cv2
 
-            if not hasattr(cv2, 'imshow'):
-                cv2.imshow = lambda *a, **k: None
-                cv2.waitKey = lambda *a, **k: 0
-                cv2.destroyAllWindows = lambda *a, **k: None
+            # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
+            # and patch missing imshow for headless environments. In the lean
+            # no-cv2 deployment the hot path never imports cv2 at all.
+            if _no_cv2():
+                pass
+            else:
+                try:
+                    import cv2
+                    # Test if cv2 is functional
+                    _ = cv2.IMREAD_COLOR
+                except (ImportError, AttributeError):
+                    import importlib.util, sys as _sys
+                    import glob as _glob
+                    # Find the .so directly
+                    _so_candidates = _glob.glob("/usr/lib/python*/dist-packages/cv2/python-*/cv2.cpython-*.so")
+                    if _so_candidates:
+                        _spec = importlib.util.spec_from_file_location("cv2", _so_candidates[0])
+                        _mod = importlib.util.module_from_spec(_spec)
+                        _spec.loader.exec_module(_mod)
+                        _sys.modules["cv2"] = _mod
+                        import cv2
+                    else:
+                        import cv2  # let it fail naturally
+
+                if not hasattr(cv2, 'imshow'):
+                    cv2.imshow = lambda *a, **k: None
+                    cv2.waitKey = lambda *a, **k: 0
+                    cv2.destroyAllWindows = lambda *a, **k: None
 
             from plugins.vision_runtime import VisionEngineSession
 
@@ -758,6 +806,31 @@ class VideoObjectPerceptionPlugin:
             return configured, self._read_vocab(
                 os.path.join(os.path.dirname(configured), "vocab.json")
             )
+
+        # Light path (Darwin VOP subnet): the 220-class nano engine baked into
+        # this image. Runtime-built, static, FP16, workspace-capped — a much
+        # smaller per-instance accelerator context than the reference
+        # open-vocab small engine, with the full competition vocabulary. Any
+        # failure falls through to the reference bundle below, so the light
+        # path can only ever reduce, never remove, capability.
+        from plugins.vop_light_runtime import light_path_enabled
+        if light_path_enabled():
+            from plugins import vop_light_runtime
+            onnx = vop_light_runtime.find_onnx()
+            names = vop_light_runtime.find_vocab() or self._vocabulary
+            if onnx and names:
+                try:
+                    engine = vop_light_runtime.ensure_light_engine(onnx, names)
+                    log.info(f"[vop] light engine ready: {engine} "
+                             f"({len(names)} classes)")
+                    return engine, names
+                except Exception as error:
+                    log.error(f"[vop] light engine path failed: {error}; "
+                              "falling back to the reference bundle",
+                              exc_info=True)
+            elif onnx:
+                log.warning("[vop] light ONNX present but no vocabulary "
+                            "readable; using reference bundle")
 
         from utils.model_downloader import ensure_vop_model
         from utils.model_progress import fetch_status
@@ -813,10 +886,10 @@ class VideoObjectPerceptionPlugin:
         except BadInput as error:
             return error.as_result()
 
-        import cv2
+        from plugins.vision_runtime import imdecode_bytes
 
         started = time.time()
-        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        frame = imdecode_bytes(data)
         if frame is None:
             return BadInput(
                 "could not decode that file as an image — check it is a real "
@@ -917,6 +990,12 @@ class VideoObjectPerceptionPlugin:
         with self._nodes_lock:
             if node_key in self._nodes:
                 return
+            if not input_topic and self._executor is None:
+                # Lean deployment, on-demand mode: no ROS node exists. The
+                # model is already loaded here; one-shot answers need nothing
+                # else.
+                log.info(f"[vop] lean on-demand start (no ROS node): {node_key}")
+                return
             icfg = self._instance_configs.get(node_key, {})
             confidence = float(icfg.get("confidence", self._confidence))
             fps = int(icfg.get("fps", self._fps))
@@ -925,7 +1004,8 @@ class VideoObjectPerceptionPlugin:
                              if "publish_color" in icfg else self._publish_color)
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
             input_for_node = input_topic or None
-            node = _VOPNode(input_for_node, self._model, confidence, fps,
+            node_cls = _ros_node_class()
+            node = node_cls(input_for_node, self._model, confidence, fps,
                             node_suffix=suffix, vocabulary=self._vocabulary,
                             publish_bbox=publish_bbox, publish_color=publish_color)
             self._executor.add_node(node)
@@ -970,6 +1050,7 @@ class VideoObjectPerceptionPlugin:
         # dies on InvalidHandle. It must also be destroyed and not merely
         # removed, or the publisher and the ROS node name leak and the next
         # start on the same topic trips "Publisher already registered".
+        from utils.ros_lifecycle import dispose_node
         dispose_node(self._executor, node, label=f"vop/{node_key}")
         return result
 
@@ -1117,6 +1198,16 @@ class VideoObjectPerceptionPlugin:
                 topics_list = args.get("input_topics") or []
                 if topics_list:
                     input_topic = topics_list[0]
+            if input_topic and self._executor is None:
+                # Lean deployment runs without ROS: camera topics cannot be
+                # served. Say so explicitly instead of loading a model for a
+                # subscription that can never exist.
+                return {
+                    "state": "error",
+                    "message": "camera topics are disabled in this lean "
+                               "deployment (no ROS runtime); use "
+                               "recognize_by_photo / recognize_by_url",
+                }
             # No topic is a supported mode, as in plugins/tts.py: the card comes
             # up on-demand, loads the engine and owns a publisher, and answers
             # recognize_by_photo / recognize_by_url. It just has nothing to

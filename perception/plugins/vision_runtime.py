@@ -68,15 +68,13 @@ class LetterboxMeta:
 
 def letterbox(image: np.ndarray, dst_w: int, dst_h: int) -> tuple[np.ndarray, LetterboxMeta]:
     """Resize preserving aspect ratio and pad to (dst_h, dst_w). Returns HWC uint8."""
-    import cv2
-
     orig_h, orig_w = image.shape[:2]
     if orig_h <= 0 or orig_w <= 0:
         raise ValueError(f"empty frame: {image.shape}")
 
     scale = min(dst_w / orig_w, dst_h / orig_h)
     new_w, new_h = max(1, round(orig_w * scale)), max(1, round(orig_h * scale))
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    resized = _resize_bgr(image, (new_w, new_h))
 
     canvas = np.full((dst_h, dst_w, image.shape[2]), PAD_VALUE, dtype=np.uint8)
     pad_x = (dst_w - new_w) // 2
@@ -452,4 +450,74 @@ class VisionEngineSession:
         return self._engine.infer(blob), meta
 
     def close(self) -> None:
-        self._engine.close()
+        self._engine.close()# ── no-cv2 helpers (lean Darwin VOP deployment) ───────────────────────────────
+#
+# VOP_NO_CV2=1 keeps OpenCV out of the process: on the shared Orin box the cv2
+# import (with its CUDA/GStreamer libraries) is a fixed cost every concurrent
+# instance pays, and the vop hot path only needs decode + resize + HSV, all of
+# which are a few numpy/PIL lines. cv2 stays the fallback when the flag is off
+# or PIL is missing.
+
+def _no_cv2() -> bool:
+    import os
+    return os.environ.get("VOP_NO_CV2", "").strip().lower() in ("1", "true", "on")
+
+
+def _resize_bgr(image: np.ndarray, size_wh: tuple) -> np.ndarray:
+    """Bilinear resize of a BGR array; PIL when VOP_NO_CV2, cv2 otherwise."""
+    if _no_cv2():
+        try:
+            from PIL import Image
+        except ImportError:
+            import cv2
+            return cv2.resize(image, tuple(size_wh), interpolation=cv2.INTER_LINEAR)
+        w, h = int(size_wh[0]), int(size_wh[1])
+        resample = getattr(Image, "Resampling", Image).BILINEAR
+        pil = Image.fromarray(np.ascontiguousarray(image[:, :, ::-1]), "RGB")
+        pil = pil.resize((w, h), resample)
+        out = np.asarray(pil, dtype=np.uint8)[:, :, ::-1]
+        return np.ascontiguousarray(out)
+    import cv2
+    return cv2.resize(image, tuple(size_wh), interpolation=cv2.INTER_LINEAR)
+
+
+def imdecode_bytes(data: bytes) -> Optional[np.ndarray]:
+    """Decode JPEG/PNG bytes to a BGR uint8 array (PIL preferred when VOP_NO_CV2)."""
+    if _no_cv2():
+        try:
+            from io import BytesIO
+            from PIL import Image
+            image = Image.open(BytesIO(data))
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            rgb = np.asarray(image, dtype=np.uint8)
+            return np.ascontiguousarray(rgb[:, :, ::-1])
+        except ImportError:
+            pass
+    import cv2
+    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+
+def bgr_to_hsv_cv(region_bgr: np.ndarray) -> np.ndarray:
+    """OpenCV-convention HSV (H 0-179, S/V 0-255) in pure numpy — no cv2 import.
+
+    Same piecewise hue formula as cv2.COLOR_BGR2HSV, which is what the colour
+    bucket tables in plugins/vop.py assume.
+    """
+    region = region_bgr.astype(np.float32) / 255.0
+    b = region[..., 0]
+    g = region[..., 1]
+    r = region[..., 2]
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+    safe = np.where(delta > 0, delta, 1.0)
+    h = np.zeros(delta.shape, dtype=np.float32)
+    h = np.where((cmax == r) & (delta > 0), (60.0 * ((g - b) / safe) % 360.0), h)
+    h = np.where((cmax == g) & (delta > 0), 60.0 * ((b - r) / safe) + 120.0, h)
+    h = np.where((cmax == b) & (delta > 0), 60.0 * ((r - g) / safe) + 240.0, h)
+    h = (h / 2.0).astype(np.float32)
+    s = np.where(cmax > 0, (delta / np.where(cmax > 0, cmax, 1.0)) * 255.0, 0.0).astype(np.float32)
+    v = (cmax * 255.0).astype(np.float32)
+    return np.stack([h, s, v], axis=-1)
+

@@ -50,9 +50,6 @@ from pathlib import Path
 
 import yaml
 
-import rclpy
-import rclpy.executors
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
@@ -670,6 +667,9 @@ def _start_registration(mcp_port: int, name: str, category: str):
     import urllib.request as _urllib
     import ssl as _ssl
     agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    if agent_core_url in ("", "disabled"):
+        log.info("[register] disabled (lean deployment, no agent-core)")
+        return
     _ctx = _ssl.create_default_context()
     _ctx.check_hostname = False
     _ctx.verify_mode = _ssl.CERT_NONE
@@ -746,6 +746,28 @@ def _prewarm_vop(bundle, cfg: dict):
     threading.Thread(target=_run, daemon=True, name="vop_prewarm").start()
 
 
+def _lean_mode(cfg: dict) -> bool:
+    """Lean deployment: run vop without the ROS2 runtime.
+
+    Enabled when the only enabled plugin is vop (the Darwin VOP subnet runs
+    exactly that, recognize-only). In lean mode the rclpy/FastRTPS runtime —
+    a fixed per-instance cost on the shared Orin box that the evaluator never
+    uses — is skipped, camera topics are refused explicitly, and OpenCV stays
+    out of the image hot path. VOP_LEAN=1/0 forces the mode for debugging.
+    """
+    flag = os.environ.get("VOP_LEAN", "auto").strip().lower()
+    if flag in ("1", "true", "on"):
+        return True
+    if flag in ("0", "false", "off"):
+        return False
+    plugins_cfg = cfg.get("plugins", {}) or {}
+    enabled = {
+        name for name, spec in plugins_cfg.items()
+        if isinstance(spec, dict) and spec.get("enabled")
+    }
+    return enabled == {"vop"}
+
+
 def main():
     global _bundle
 
@@ -766,8 +788,18 @@ def main():
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")
 
-    rclpy.init()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    lean = _lean_mode(cfg)
+    executor = None
+    if lean:
+        os.environ.setdefault("VOP_NO_CV2", "1")
+        if not os.environ.get("AGENT_CORE_URL"):
+            os.environ["AGENT_CORE_URL"] = "disabled"
+        log.info("lean mode: ROS2 runtime disabled (vop recognize-only)")
+    else:
+        import rclpy
+        import rclpy.executors
+        rclpy.init()
+        executor = rclpy.executors.MultiThreadedExecutor()
     _bundle  = PerceptionBundle(cfg, executor)
 
     def _spin():
@@ -802,7 +834,8 @@ def main():
                               "ROS callbacks were interrupted")
                 time.sleep(1.0)
 
-    threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
+    if executor is not None:
+        threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
     # This deployment runs a single plugin (vop); start its engine load
     # now so the first judged request is not the cold one.
@@ -827,8 +860,11 @@ def main():
         server.serve_forever()
     finally:
         _bundle.shutdown()
-        executor.shutdown()
-        rclpy.shutdown()
+        if executor is not None:
+            executor.shutdown()
+        if not lean:
+            import rclpy
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
