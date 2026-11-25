@@ -1,0 +1,133 @@
+"""Regression: a card removed from the layout must have its instance stopped.
+
+Observed on orin5 2026-08-24. The dashboard showed TTS running and silent. The ROS
+graph had two vits2 nodes — `vits2_trt_card_mt4rkb752py8` publishing to
+`/remote_control/message/tts`, and `vits2_trt_card_mt8rck6q87qd`, the live one, on
+`/remote_control/mic/asr/tts`. The first belonged to a card the operator had
+deleted. Nothing had stopped it: `_do_stop_project` walks
+`config.main['canvas_layout']['cards']`, and that card was no longer in the list,
+so it was unreachable the moment it was deleted. Its ROS node, its subscription and
+its CUDA context lived until perception exited, and the audio panel was watching
+the topic the orphan owned.
+
+Every removal path — deleting a card, another editor's layout reload, loading a
+solution — ends in a layout write, so the diff is enforced there.
+
+Run: cd agent-core && python3 -m pytest tests/test_layout_stop_removed.py
+"""
+import asyncio
+import os
+import pathlib
+import sys
+import tempfile
+
+import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
+
+os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
+
+from api import config as config_api  # noqa: E402
+
+TTS_OLD = {'id': 'card_mt4rkb752py8', 'mcpId': 'mcp-1', 'toolName': 'tts'}
+TTS_NEW = {'id': 'card_mt8rck6q87qd', 'mcpId': 'mcp-1', 'toolName': 'tts'}
+ASR = {'id': 'card_asr', 'mcpId': 'mcp-1', 'toolName': 'asr'}
+
+
+@pytest.fixture
+def calls(monkeypatch):
+    """Record every MCP call the layout write makes."""
+    seen = []
+
+    async def _fake_call(mcp_id, req, timeout_s=None):
+        # `timeout_s` 不是可选的摆设：`_stop_cards` 现在每张卡片都带死线，而这个
+        # 替身不接受它的话，TypeError 会被那边的 except 吞成「这张卡片没停下来」。
+        #
+        # 返回值也不是：`stop_one` 现在**读结果**，所以替身必须长得像
+        # `mcp_call_tool` 真正返回的东西 —— `{'code': 200, 'data': ...}`。
+        # 少一个 `code` 就被判成「设备拒绝停止请求」，于是每张卡片都报失败。
+        seen.append((mcp_id, req.tool, dict(req.arguments), timeout_s))
+        return {'code': 200, 'data': {'state': 'idle'}}
+
+    class _Req:
+        def __init__(self, tool, arguments):
+            self.tool = tool
+            self.arguments = arguments
+
+    mod = type(sys)('api.mcp_manage')
+    mod.mcp_call_tool = _fake_call
+    mod.MCPCallRequest = _Req
+    monkeypatch.setitem(sys.modules, 'api.mcp_manage', mod)
+    return seen
+
+
+def _run(old, new):
+    return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        config_api.stop_removed_cards(old, new))
+
+
+def test_the_orphan_case_stops_exactly_the_deleted_card(calls):
+    """The reported layout: the old TTS card is replaced by a new one."""
+    assert _run([TTS_OLD, ASR], [TTS_NEW, ASR]) == 1
+    assert calls == [('mcp-1', 'tts',
+                      {'action': 'stop', 'instance_id': 'card_mt4rkb752py8'},
+                      config_api.STOP_CARD_TIMEOUT_S)]
+
+
+def test_an_unchanged_layout_calls_nothing(calls):
+    """Layout writes happen on every drag; only removals may have side effects."""
+    assert _run([TTS_OLD, ASR], [TTS_OLD, ASR]) == 0
+    assert calls == []
+
+
+def test_a_moved_card_is_not_a_removed_card(calls):
+    """Identity is the card id, not the dict — x/y change on every drag."""
+    moved = dict(TTS_OLD, x=400, y=120)
+    assert _run([TTS_OLD], [moved]) == 0
+    assert calls == []
+
+
+def test_clearing_the_canvas_stops_every_card(calls):
+    assert _run([TTS_OLD, ASR], []) == 2
+    assert {c[2]['instance_id'] for c in calls} == {'card_mt4rkb752py8', 'card_asr'}
+    assert all(c[3] == config_api.STOP_CARD_TIMEOUT_S for c in calls), \
+        '删卡片的清理也要带死线 —— 一台不回应的设备不能卡住保存布局'
+
+
+def test_adding_a_card_stops_nothing(calls):
+    assert _run([ASR], [ASR, TTS_NEW]) == 0
+    assert calls == []
+
+
+def test_cards_without_a_device_are_skipped(calls):
+    """A half-built card has no mcpId; there is nothing to stop and no crash."""
+    assert _run([{'id': 'card_x'}, {'id': 'card_y', 'mcpId': '', 'toolName': 'tts'}], []) == 0
+    assert calls == []
+
+
+def test_a_card_with_no_id_is_ignored(calls):
+    assert _run([{'mcpId': 'mcp-1', 'toolName': 'tts'}], []) == 0
+    assert calls == []
+
+
+def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
+    """The layout must still be saved even if one device is unreachable."""
+    seen = []
+
+    async def _flaky(mcp_id, req, timeout_s=None):
+        seen.append(req.arguments['instance_id'])
+        if req.arguments['instance_id'] == 'card_mt4rkb752py8':
+            raise RuntimeError('connection refused')
+        return {'code': 200, 'data': {'state': 'idle'}}
+
+    sys.modules['api.mcp_manage'].mcp_call_tool = _flaky
+    assert _run([TTS_OLD, ASR], []) == 1          # one of two succeeded
+    # 并行了，所以到达顺序不再保证 —— 要断言的是「两张都试过」，而不是先后。
+    assert sorted(seen) == ['card_asr', 'card_mt4rkb752py8']
+
+
+def test_none_layouts_are_tolerated(calls):
+    """An empty ConfigDB gives `canvas_layout` as {} — .get('cards') is None."""
+    assert _run(None, None) == 0
+    assert _run(None, [TTS_NEW]) == 0
+    assert calls == []

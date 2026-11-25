@@ -1,0 +1,463 @@
+"""
+tests/vision_stubs.py — Shared fakes for vision-plugin unit tests.
+
+Importing this module installs fake rclpy / sensor_msgs / std_msgs modules
+into sys.modules (so plugin modules import cleanly off-robot) and puts the
+perception root on sys.path. test_ocr_plugin.py and test_obstacle_plugin.py
+both import from here; conftest.py imports it first so the stubs are in place
+before any plugin module is imported.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import threading
+import time
+import types
+from pathlib import Path
+
+import pytest
+
+PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
+if str(PERCEPTION_ROOT) not in sys.path:
+    sys.path.insert(0, str(PERCEPTION_ROOT))
+
+
+# ── fake ROS ─────────────────────────────────────────────────────────────────
+
+class _FakePublisher:
+    def __init__(self, topic):
+        self.topic = topic
+        self.messages = []
+        # The whole message, alongside `messages` (which keeps only `data`, as
+        # every existing test indexes it that way). A card that republishes
+        # audio has to preserve the *input's* header stamp, and that assertion
+        # needs the header.
+        self.raw_messages = []
+        # TTS gates each utterance on a matched reader; tests that do not care
+        # about the gate get a reader by default.
+        self.subscription_count = 1
+
+    def publish(self, msg):
+        self.messages.append(msg.data)
+        self.raw_messages.append(msg)
+
+    def get_subscription_count(self):
+        return self.subscription_count
+
+
+class _FakeSubscription:
+    def __init__(self, topic, callback, qos):
+        self.topic = topic
+        self.callback = callback
+        self.qos = qos
+
+
+class _FakeNode:
+    instances: list = []
+
+    def __init__(self, name):
+        self._name = name
+        self.publishers = []
+        self.subscriptions = []
+        self.destroyed = False
+        _FakeNode.instances.append(self)
+
+    def get_name(self):
+        return self._name
+
+    def create_publisher(self, msg_type, topic, qos):
+        publisher = _FakePublisher(topic)
+        self.publishers.append(publisher)
+        return publisher
+
+    def create_subscription(self, msg_type, topic, callback, qos):
+        subscription = _FakeSubscription(topic, callback, qos)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def destroy_subscription(self, subscription):
+        # Plugins drop the subscription on stop() and recreate it on the next
+        # start(); the tests assert on what is left registered here.
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
+
+    def destroy_node(self):
+        self.destroyed = True
+
+    def get_clock(self):
+        return _FakeClock()
+
+
+class _FakeClock:
+    def now(self):
+        return self
+
+    def to_msg(self):
+        return 0
+
+
+class _FakeExecutor:
+    def __init__(self):
+        self.nodes = []
+
+    def add_node(self, node):
+        self.nodes.append(node)
+
+    def remove_node(self, node):
+        self.nodes.remove(node)
+
+
+class _FakeString:
+    def __init__(self):
+        self.data = ""
+
+
+class _FakeHeader:
+    """`stamp` is the only field anything here sets, but the attribute has to
+    exist: a publisher that stamps its outgoing frames (pose's overlay) would
+    otherwise fail inside its own try/except and publish nothing, which looks
+    like a disabled feature rather than a missing stub."""
+
+    def __init__(self):
+        self.stamp = 0
+        self.frame_id = ""
+
+
+class _FakeCompressedImage:
+    # Defaults so a plugin that *publishes* one can construct it the way ROS
+    # does — `CompressedImage()` then assign — as well as tests that build an
+    # incoming frame in one call.
+    def __init__(self, data: bytes = b"", fmt="jpeg"):
+        self.data = data
+        self.format = fmt
+        self.header = _FakeHeader()
+
+
+class _FakeAudioChunk:
+    """Stands in for audio_msgs.msg.AudioChunk (built from a ROS .msg on device)."""
+
+    def __init__(self):
+        # A real AudioChunk always *has* a stamp (a zeroed builtin_interfaces
+        # Time), so a plugin may assign `header.stamp.sec`. This used to be
+        # None, which only works for code that replaces the whole stamp object.
+        self.header = types.SimpleNamespace(
+            stamp=types.SimpleNamespace(sec=0, nanosec=0))
+        self.format = ""
+        self.data = []
+
+
+def _install_fake_ros():
+    rclpy = types.ModuleType("rclpy")
+    node_mod = types.ModuleType("rclpy.node")
+    node_mod.Node = _FakeNode
+    # main.py does `import rclpy.executors`, which needs rclpy to be a package
+    # with that submodule attached — a bare ModuleType is not, and the import
+    # fails with "'rclpy' is not a package".
+    executors_mod = types.ModuleType("rclpy.executors")
+    executors_mod.MultiThreadedExecutor = _FakeExecutor
+    executors_mod.SingleThreadedExecutor = _FakeExecutor
+    rclpy.executors = executors_mod
+    rclpy.node = node_mod
+    rclpy.init = lambda *args, **kwargs: None
+    rclpy.shutdown = lambda *args, **kwargs: None
+    qos_mod = types.ModuleType("rclpy.qos")
+
+    class QoSProfile:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def __eq__(self, other):
+            return isinstance(other, QoSProfile) and self.__dict__ == other.__dict__
+
+    qos_mod.QoSProfile = QoSProfile
+    qos_mod.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT="best_effort", RELIABLE="reliable")
+    qos_mod.HistoryPolicy = types.SimpleNamespace(KEEP_LAST="keep_last", KEEP_ALL="keep_all")
+    qos_mod.DurabilityPolicy = types.SimpleNamespace(VOLATILE="volatile", TRANSIENT_LOCAL="tl")
+    sensor_msgs = types.ModuleType("sensor_msgs")
+    sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
+    sensor_msgs_msg.CompressedImage = _FakeCompressedImage
+    std_msgs = types.ModuleType("std_msgs")
+    std_msgs_msg = types.ModuleType("std_msgs.msg")
+    std_msgs_msg.String = _FakeString
+    audio_msgs = types.ModuleType("audio_msgs")
+    audio_msgs_msg = types.ModuleType("audio_msgs.msg")
+    audio_msgs_msg.AudioChunk = _FakeAudioChunk
+    for name, module in {
+        "rclpy": rclpy, "rclpy.node": node_mod, "rclpy.qos": qos_mod,
+        "rclpy.executors": executors_mod,
+        "sensor_msgs": sensor_msgs, "sensor_msgs.msg": sensor_msgs_msg,
+        "std_msgs": std_msgs, "std_msgs.msg": std_msgs_msg,
+        "audio_msgs": audio_msgs, "audio_msgs.msg": audio_msgs_msg,
+    }.items():
+        sys.modules[name] = module
+
+
+def _install_fake_cv2():
+    """Minimal cv2 for host-side tests.
+
+    The vision plugins do `import cv2` inside their worker threads, so without
+    this every worker dies on its first frame and the failure surfaces only as
+    a PytestUnhandledThreadExceptionWarning — easy to scroll past while
+    believing the pipeline was exercised. Only the handful of calls those
+    workers make are implemented; anything else raises rather than quietly
+    returning something plausible.
+
+    Skipped when the real cv2 is importable, so a machine that has it tests
+    against the real thing.
+    """
+    try:
+        import cv2  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import numpy as _np
+
+    cv2 = types.ModuleType("cv2")
+    cv2.IMREAD_COLOR = 1
+    cv2.INTER_NEAREST = 0
+    cv2.INTER_LINEAR = 1
+    # The stub's `resize` ignores the mode, but a missing *constant* is an
+    # AttributeError at the call site — so a plugin that asks for a better
+    # filter fails here and nowhere else. Same trap as `frame_bytes`: a test
+    # that is green only on a host with real OpenCV is green exactly where the
+    # code does not run.
+    cv2.INTER_CUBIC = 2
+    cv2.INTER_AREA = 3
+    cv2.BORDER_REFLECT_101 = 4
+
+    def imdecode(buf, flags):
+        # Tests hand in a raw "WxH" marker rather than a real JPEG; anything
+        # unparseable decodes to None, which is what a corrupt frame does.
+        try:
+            width, height = (int(v) for v in bytes(buf).decode().split("x"))
+        except Exception:
+            return None
+        return _np.zeros((height, width, 3), dtype=_np.uint8)
+
+    def resize(src, dsize, interpolation=0):
+        width, height = dsize
+        rows = (_np.arange(height) * src.shape[0] // height).clip(0, src.shape[0] - 1)
+        cols = (_np.arange(width) * src.shape[1] // width).clip(0, src.shape[1] - 1)
+        return src[rows][:, cols]
+
+    def copyMakeBorder(src, top, bottom, left, right, borderType):
+        """Only BORDER_REFLECT_101, which is what the hand crop asks for.
+
+        numpy's `reflect` is exactly OpenCV's REFLECT_101 — it mirrors without
+        repeating the edge pixel. The other border modes raise rather than
+        falling back to this one: a stub that silently substituted a different
+        extension would change the pixels the hand engine sees at the frame
+        edge, which is precisely where a raised hand sits.
+        """
+        if borderType != cv2.BORDER_REFLECT_101:
+            raise NotImplementedError(
+                f"fake cv2.copyMakeBorder only implements BORDER_REFLECT_101, "
+                f"got {borderType}")
+        pad = [(int(top), int(bottom)), (int(left), int(right))]
+        pad += [(0, 0)] * (src.ndim - 2)
+        return _np.pad(src, pad, mode="reflect")
+
+    def _bgr2hsv(src):
+        """OpenCV's 8-bit HSV ranges, not the textbook ones.
+
+        H is halved to 0..179 so it fits a byte, S and V are 0..255. A stub
+        that returned H in 0..359 would look right and put every hue in the
+        wrong bin, which is the sort of green nobody would question.
+        """
+        bgr = src.astype(_np.float32)
+        blue, green, red = bgr[..., 0], bgr[..., 1], bgr[..., 2]
+        value = bgr.max(axis=-1)
+        chroma = value - bgr.min(axis=-1)
+        # Grey pixels have no hue and no saturation; the divisions below are
+        # masked rather than guarded so a whole flat frame stays vectorised.
+        safe_chroma = _np.where(chroma == 0, 1.0, chroma)
+        hue = _np.select(
+            [value == red, value == green],
+            [60.0 * (green - blue) / safe_chroma,
+             120.0 + 60.0 * (blue - red) / safe_chroma],
+            default=240.0 + 60.0 * (red - green) / safe_chroma,
+        )
+        hue = _np.where(chroma == 0, 0.0, hue) % 360.0
+        saturation = _np.where(value == 0, 0.0, chroma / _np.where(value == 0, 1.0, value) * 255.0)
+        return _np.stack([
+            _np.round(hue / 2.0), _np.round(saturation), _np.round(value),
+        ], axis=-1).astype(_np.uint8)
+
+    def cvtColor(src, code):
+        if code == cv2.COLOR_BGR2GRAY:
+            return src.mean(axis=2).astype(_np.uint8)
+        if code == cv2.COLOR_BGR2HSV:
+            return _bgr2hsv(src)
+        raise NotImplementedError(f"fake cv2: cvtColor code {code}")
+
+    def connectedComponents(image, connectivity=8):
+        """Two-pass labelling with union-find. 4-connectivity only.
+
+        Small and slow, which is fine: the frames in these tests are tens of
+        pixels across. It exists so `lens_barrel_mask` runs for real here —
+        stubbing it out to "no mask" would make every test of the masking path
+        pass by not testing it.
+        """
+        rows, cols = image.shape
+        labels = _np.zeros((rows, cols), dtype=_np.int32)
+        parent = [0]
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        for r in range(rows):
+            for c in range(cols):
+                if not image[r, c]:
+                    continue
+                up = labels[r - 1, c] if r else 0
+                left = labels[r, c - 1] if c else 0
+                if up and left:
+                    labels[r, c] = min(up, left)
+                    union(up, left)
+                elif up or left:
+                    labels[r, c] = up or left
+                else:
+                    parent.append(len(parent))
+                    labels[r, c] = len(parent) - 1
+
+        remap, nxt = {0: 0}, 1
+        for r in range(rows):
+            for c in range(cols):
+                if not labels[r, c]:
+                    continue
+                root = find(labels[r, c])
+                if root not in remap:
+                    remap[root] = nxt
+                    nxt += 1
+                labels[r, c] = remap[root]
+        return nxt, labels
+
+    cv2.COLOR_BGR2GRAY = 6
+    # ── drawing + encoding, for the pose overlay path ────────────────────
+    #
+    # Approximations, and deliberately so: their only job is to let a test
+    # assert that the drawing code ran and touched the canvas. Without them
+    # `draw_skeleton` raises AttributeError inside the plugin's own
+    # try/except, the overlay silently publishes nothing, and the test passes
+    # on a host with no OpenCV while the real path is never exercised — which
+    # is precisely the failure mode frame_bytes() exists to prevent.
+
+    def line(img, pt1, pt2, colour, thickness=1, lineType=0):
+        steps = max(abs(pt2[0] - pt1[0]), abs(pt2[1] - pt1[1]), 1) + 1
+        xs = _np.linspace(pt1[0], pt2[0], steps).round().astype(int)
+        ys = _np.linspace(pt1[1], pt2[1], steps).round().astype(int)
+        inside = ((xs >= 0) & (xs < img.shape[1]) & (ys >= 0) & (ys < img.shape[0]))
+        img[ys[inside], xs[inside]] = colour
+        return img
+
+    def circle(img, centre, radius, colour, thickness=1, lineType=0):
+        x, y = int(centre[0]), int(centre[1])
+        r = max(int(radius), 1)
+        y0, y1 = max(y - r, 0), min(y + r + 1, img.shape[0])
+        x0, x1 = max(x - r, 0), min(x + r + 1, img.shape[1])
+        img[y0:y1, x0:x1] = colour       # a square, not a disc
+        return img
+
+    def rectangle(img, pt1, pt2, colour, thickness=1, lineType=0):
+        x1, y1 = int(pt1[0]), int(pt1[1])
+        x2, y2 = int(pt2[0]), int(pt2[1])
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        x1, x2 = max(0, x1), min(img.shape[1] - 1, x2)
+        y1, y2 = max(0, y1), min(img.shape[0] - 1, y2)
+        if thickness < 0:
+            img[y1:y2 + 1, x1:x2 + 1] = colour
+            return img
+        width = max(1, int(thickness))
+        for i in range(width):
+            if y1 + i <= y2:
+                img[y1 + i, x1:x2 + 1] = colour
+                img[y2 - i, x1:x2 + 1] = colour
+            if x1 + i <= x2:
+                img[y1:y2 + 1, x1 + i] = colour
+                img[y1:y2 + 1, x2 - i] = colour
+        return img
+
+    def putText(img, text, org, fontFace, fontScale, colour, thickness=1,
+                lineType=0):
+        cv2.__text_calls__.append((text, tuple(org)))
+        return img
+
+    def imencode(ext, img, params=None):
+        # Returns the same b"WxH" marker frame_bytes() produces, so an encoded
+        # overlay can be handed straight back to imdecode in a test.
+        height, width = img.shape[:2]
+        return True, _np.frombuffer(f"{width}x{height}".encode(), dtype=_np.uint8)
+
+    cv2.LINE_AA = 16
+    cv2.FONT_HERSHEY_SIMPLEX = 0
+    cv2.IMWRITE_JPEG_QUALITY = 1
+    cv2.__text_calls__ = []
+    cv2.line = line
+    cv2.circle = circle
+    cv2.rectangle = rectangle
+    cv2.putText = putText
+    cv2.imencode = imencode
+
+    cv2.COLOR_BGR2HSV = 40
+    cv2.imdecode = imdecode
+    cv2.resize = resize
+    cv2.copyMakeBorder = copyMakeBorder
+    cv2.cvtColor = cvtColor
+    cv2.connectedComponents = connectedComponents
+    cv2.__motus_fake__ = True
+    sys.modules["cv2"] = cv2
+
+
+_install_fake_ros()
+_install_fake_cv2()
+
+
+def frame_bytes(width: int = 200, height: int = 100, fill: int = 0) -> bytes:
+    """A payload the *active* cv2 decodes into a height×width×3 BGR frame.
+
+    The fake cv2's `imdecode` reads a `b"WxH"` marker, which is cheap and needs
+    no encoder on a host that has no OpenCV. But those markers were written as
+    literals throughout the plugin tests, so on a machine that *does* have
+    OpenCV — every perception image, and therefore every PR-review-bot run —
+    real `imdecode` returned None, the worker skipped the frame, and 29 tests
+    across vop and visual_depth failed on "nothing was published". The suite
+    was green exactly where the code does not run and red exactly where it
+    does, which is the worst way round.
+
+    Going through this helper means one payload format per host: a marker when
+    the frame will be decoded by the stub, a genuine JPEG when it will be
+    decoded by OpenCV. A uniform fill survives JPEG quantisation exactly, so
+    colour and brightness assertions hold either way.
+    """
+    import cv2
+
+    if getattr(cv2, "__motus_fake__", False):
+        return f"{width}x{height}".encode()
+
+    import numpy as np
+
+    ok, buffer = cv2.imencode(".jpg", np.full((height, width, 3), fill, dtype=np.uint8))
+    if not ok:
+        raise RuntimeError("cv2.imencode failed to build a test frame")
+    return buffer.tobytes()
+
+
+def _wait_until(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
