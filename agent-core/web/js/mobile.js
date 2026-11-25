@@ -1,0 +1,352 @@
+/**
+ * mobile.js — Mobile-native navigation with bottom tab bar.
+ * Handles: sidebar drawer (fab), tab switching, log drawer, settings panel.
+ */
+
+import { enterMonitorMode, exitMonitorMode } from './monitor-mode.js';
+import { refreshAccount } from './account.js';
+
+const MQ = window.matchMedia('(max-width: 768px)');
+let _isMobile = MQ.matches;
+let _overlay;
+let _currentTab = 'configure';
+
+export function isMobile() { return _isMobile; }
+
+export function initMobile() {
+  _overlay = document.getElementById('mobile-overlay');
+  if (!_overlay) {
+    _overlay = document.createElement('div');
+    _overlay.id = 'mobile-overlay';
+    _overlay.className = 'mobile-overlay';
+    document.body.appendChild(_overlay);
+  }
+  _overlay.addEventListener('click', _closeAll);
+
+  // Sidebar fab (configure tab only)
+  const sidebarFab = document.getElementById('mobile-sidebar-fab');
+  if (sidebarFab) {
+    sidebarFab.addEventListener('click', _toggleSidebar);
+  }
+
+  // Every affordance that opens or closes the log goes through one function, so
+  // the two presentations cannot disagree about the current state.
+  for (const id of ['mobile-log-fab', 'monitor-log-btn']) {
+    document.getElementById(id)?.addEventListener('click', toggleLog);
+  }
+
+  // The ▼ inside the header. It sits inside #activity-toggle, which also
+  // listens, so it has to stop the event rather than let both fire and cancel
+  // each other out.
+  const collapseBtn = document.getElementById('activity-collapse-btn');
+  if (collapseBtn) {
+    collapseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleLog();
+    });
+  }
+
+  // Tab bar
+  _initTabBar();
+
+  // Settings panel actions
+  _initSettings();
+
+  // Listen for breakpoint changes
+  MQ.addEventListener('change', (e) => {
+    _isMobile = e.matches;
+    if (!_isMobile) {
+      _closeAll();
+      _hideSettingsPanel();
+      _closeLogDrawer();
+    }
+  });
+
+  // Observe desktop update-banner for mobile mirroring
+  _observeUpdateBanner();
+}
+
+// ── Tab Bar ──────────────────────────────────────────────────────────────────
+
+function _initTabBar() {
+  const tabbar = document.getElementById('mobile-tabbar');
+  if (!tabbar) return;
+  tabbar.addEventListener('click', (e) => {
+    const btn = e.target.closest('.tabbar-btn');
+    if (!btn) return;
+    const tab = btn.dataset.tab;
+    if (tab === _currentTab) return;
+    _switchTab(tab);
+  });
+}
+
+function _switchTab(tab) {
+  _currentTab = tab;
+
+  // Update active button
+  document.querySelectorAll('.tabbar-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === tab)
+  );
+
+  // Close drawers
+  closeSidebarMobile();
+  _closeLogDrawer();
+
+  // Close any open modal overlays
+  document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(o => o.classList.add('hidden'));
+
+  // Sidebar fab: only in configure
+  const sidebarFab = document.getElementById('mobile-sidebar-fab');
+  if (sidebarFab) {
+    sidebarFab.classList.toggle('hidden', tab !== 'configure');
+  }
+
+  // Log fab: in configure and monitor
+  const logFab = document.getElementById('mobile-log-fab');
+  if (logFab) {
+    logFab.classList.toggle('hidden', tab === 'settings' || tab === 'account');
+  }
+
+  const settingsPanel = document.getElementById('mobile-settings-panel');
+
+  if (tab === 'configure') {
+    exitMonitorMode();
+    _hidePanels();
+  } else if (tab === 'monitor') {
+    _hidePanels();
+    enterMonitorMode();
+  } else if (tab === 'settings') {
+    exitMonitorMode();
+    _showPanel('mobile-settings-panel');
+  } else if (tab === 'account') {
+    exitMonitorMode();
+    _showPanel('mobile-account-panel');
+    refreshAccount();
+  }
+}
+
+// 设置与「我的」是两个同构的整页面板，共用 .settings-active 那套让画布/监控
+// 让位的布局状态，所以切换时必须先把另一个收起来。
+const _PANEL_IDS = ['mobile-settings-panel', 'mobile-account-panel'];
+
+function _showPanel(id) {
+  const app = document.getElementById('app');
+  _PANEL_IDS.forEach(pid => {
+    const panel = document.getElementById(pid);
+    if (!panel) return;
+    const on = pid === id;
+    panel.classList.toggle('hidden', !on);
+    panel.classList.toggle('active', on);
+  });
+  app?.classList.add('settings-active');
+}
+
+function _hidePanels() {
+  const app = document.getElementById('app');
+  _PANEL_IDS.forEach(pid => {
+    const panel = document.getElementById(pid);
+    if (!panel) return;
+    panel.classList.add('hidden');
+    panel.classList.remove('active');
+  });
+  app?.classList.remove('settings-active');
+}
+
+function _hideSettingsPanel() { _hidePanels(); }
+
+// ── Settings Panel ───────────────────────────────────────────────────────────
+
+function _initSettings() {
+  const panel = document.getElementById('mobile-settings-panel');
+  if (!panel) return;
+
+  panel.addEventListener('click', (e) => {
+    const item = e.target.closest('.settings-item');
+    if (!item) return;
+    const action = item.dataset.action;
+    _triggerSettingsAction(action);
+  });
+}
+
+function _triggerSettingsAction(action) {
+  const btnMap = {
+    'network': 'btn-network',
+    'history': 'btn-history',
+    'agent-def': 'btn-agent-def',
+    'channels': 'btn-channels',
+    'deploy': 'btn-deploy',
+    'performance': 'btn-performance',
+    'usage': 'btn-usage',
+    'reset': 'btn-reset',
+  };
+  const btnId = btnMap[action];
+  if (btnId) {
+    document.getElementById(btnId)?.click();
+  }
+}
+
+// ── Sidebar Drawer ───────────────────────────────────────────────────────────
+
+function _toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar) return;
+  const open = sidebar.classList.toggle('mobile-open');
+  if (open) {
+    _overlay.classList.add('active');
+  } else {
+    _overlay.classList.remove('active');
+  }
+}
+
+export function openSidebarMobile() {
+  if (!_isMobile) return;
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) sidebar.classList.add('mobile-open');
+  if (_overlay) _overlay.classList.add('active');
+}
+
+export function closeSidebarMobile() {
+  if (!_isMobile) return;
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) sidebar.classList.remove('mobile-open');
+  if (_overlay) _overlay.classList.remove('active');
+}
+
+// ── Log Drawer (Activity Strip) ──────────────────────────────────────────────
+
+function _toggleLogDrawer() {
+  const strip = document.getElementById('activity-strip');
+  if (!strip) return;
+  const open = strip.classList.toggle('mobile-log-open');
+  if (open) {
+    _overlay.classList.add('active');
+  } else {
+    _overlay.classList.remove('active');
+  }
+}
+
+/**
+ * Open or close the activity log, whichever way this viewport presents it.
+ *
+ * The log has two presentations — a collapsible bottom bar above 768px, a
+ * right-hand drawer at or below it — and each had its own idea of how to close
+ * it. Below 768px the strip is parked off-screen with `translateX(100%)` and the
+ * `collapsed` class is deliberately neutralised, so the bar's own header toggle
+ * was both invisible and inert: measured on a 768x1024 tablet, the header sat at
+ * x=769 with nothing hit-testable there, yet clicking it still wrote
+ * `activity-collapsed: 1`. That flag then travelled to the next desktop session
+ * as a bar that was already shut.
+ *
+ * One entry point for every affordance, so which one the user reaches for stops
+ * mattering.
+ */
+export function toggleLog() {
+  const strip = document.getElementById('activity-strip');
+  if (!strip) return false;
+  if (_isMobile) {
+    _toggleLogDrawer();
+    return strip.classList.contains('mobile-log-open');
+  }
+  const collapsed = !strip.classList.contains('collapsed');
+  strip.classList.toggle('collapsed', collapsed);
+  // Only meaningful for the bottom bar; writing it from drawer mode is what let
+  // a hidden state cross between the two.
+  localStorage.setItem('activity-collapsed', collapsed ? '1' : '0');
+  return !collapsed;
+}
+
+function _closeLogDrawer() {
+  const strip = document.getElementById('activity-strip');
+  if (strip) strip.classList.remove('mobile-log-open');
+  // The dimming overlay is what makes the rest of the page unclickable, so it
+  // has to go with the drawer. Closing on a breakpoint change left it behind.
+  if (_overlay) _overlay.classList.remove('active');
+}
+
+// ── Detail Panel ─────────────────────────────────────────────────────────────
+
+export function openDetailPanelMobile() {
+  if (!_isMobile) return;
+  const detail = document.getElementById('detail-panel');
+  if (detail) {
+    detail.classList.add('mobile-open');
+    _overlay.classList.add('active');
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar) sidebar.classList.remove('mobile-open');
+  }
+}
+
+export function closeDetailPanelMobile() {
+  if (!_isMobile) return;
+  const detail = document.getElementById('detail-panel');
+  if (detail) detail.classList.remove('mobile-open');
+  if (_overlay) _overlay.classList.remove('active');
+}
+
+// ── Close All ────────────────────────────────────────────────────────────────
+
+function _closeAll() {
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) sidebar.classList.remove('mobile-open');
+  const detail = document.getElementById('detail-panel');
+  if (detail) detail.classList.remove('mobile-open');
+  _closeLogDrawer();
+  if (_overlay) _overlay.classList.remove('active');
+}
+
+// ── Update Banner Mirroring ──────────────────────────────────────────────────
+
+function _observeUpdateBanner() {
+  const desktopBanner = document.getElementById('update-banner');
+  if (!desktopBanner) return;
+
+  const mobileBanner = document.getElementById('mobile-update-banner');
+  const mobileText = document.getElementById('mobile-update-text');
+  const mobileBtn = document.getElementById('mobile-update-btn');
+  const badge = document.getElementById('settings-badge');
+
+  function sync() {
+    const hasUpdate = !desktopBanner.classList.contains('hidden');
+    if (hasUpdate) {
+      const text = document.getElementById('update-banner-text')?.textContent || '';
+      if (mobileText) mobileText.textContent = text;
+      if (mobileBanner) mobileBanner.classList.remove('hidden');
+      if (badge) badge.classList.remove('hidden');
+    } else {
+      if (mobileBanner) mobileBanner.classList.add('hidden');
+      if (badge) badge.classList.add('hidden');
+    }
+  }
+
+  // Mirror click to desktop update button
+  if (mobileBtn) {
+    mobileBtn.addEventListener('click', () => {
+      document.getElementById('btn-update')?.click();
+    });
+  }
+
+  // Observe class changes on desktop banner (show/hide)
+  const observer = new MutationObserver(sync);
+  observer.observe(desktopBanner, { attributes: true, attributeFilter: ['class'] });
+
+  // Observe text changes in desktop banner text (progress updates)
+  const desktopText = document.getElementById('update-banner-text');
+  if (desktopText && mobileText) {
+    const textObserver = new MutationObserver(() => {
+      mobileText.textContent = desktopText.textContent;
+    });
+    textObserver.observe(desktopText, { childList: true, characterData: true, subtree: true });
+  }
+
+  // Observe disabled state on desktop button (syncs to mobile button)
+  const desktopBtn = document.getElementById('btn-update');
+  if (desktopBtn && mobileBtn) {
+    const btnObserver = new MutationObserver(() => {
+      mobileBtn.disabled = desktopBtn.disabled;
+    });
+    btnObserver.observe(desktopBtn, { attributes: true, attributeFilter: ['disabled'] });
+  }
+
+  // Initial sync
+  sync();
+}
