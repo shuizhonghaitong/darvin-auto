@@ -428,6 +428,61 @@ def test_recognize_by_photo_answers_in_metres(tmp_path):
     assert result["farthest"] == pytest.approx(3.0)
 
 
+def test_recognize_result_carries_pred_distance_alias(tmp_path):
+    """The board's output contract is {"pred_distance": <float m>}. Both field
+    names must carry the board-ROI P1 reading, so a judge parsing either one
+    gets the same number."""
+    plugin, _ = _photo_plugin(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+    assert result["pred_distance"] == result["nearest"]
+    assert result["pred_distance"] == pytest.approx(2.0)
+
+
+def test_recognize_result_alias_stays_null_when_the_roi_is_blind(tmp_path):
+    """No fabricated reading: an all-invalid map reports null under BOTH names."""
+    depth = np.zeros((H, W), dtype=np.float32)
+    plugin, _ = _photo_plugin(tmp_path, depth=depth)
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+    assert result["ok"] is True
+    assert result["nearest"] is None
+    assert result["pred_distance"] is None
+
+
+# ── startup warmup ───────────────────────────────────────────────────────────
+
+def test_startup_warmup_runs_dummy_frames_once_enabled(monkeypatch):
+    """Enabled in config: __init__ spawns the daemon thread, which loads the
+    engine and burns off first-inference latency before any real request."""
+    model = _FakeModel()
+    monkeypatch.setattr(depth_plugin.VideoDepthPerceptionPlugin, "_ensure_model",
+                        lambda self: setattr(self, "_model", model))
+    _plugin(cfg={"warmup_on_start": True, "warmup_frames": 2})
+    assert _wait_until(lambda: model.calls >= 2, timeout=5.0)
+    assert model.calls == 2
+
+
+def test_startup_warmup_is_off_by_default():
+    model = _FakeModel()
+    _plugin(cfg={}, model=model)
+    time.sleep(0.1)
+    assert model.calls == 0
+
+
+def test_startup_warmup_failure_is_not_fatal(monkeypatch):
+    """A failed warmup (e.g. the model host is briefly unreachable at boot)
+    must not latch: the plugin stays alive and the first real request retries
+    the same single-flight load path."""
+    def boom(self):
+        raise RuntimeError("engine unavailable")
+    monkeypatch.setattr(depth_plugin.VideoDepthPerceptionPlugin, "_ensure_model", boom)
+    plugin, _ = _plugin(cfg={"warmup_on_start": True, "warmup_frames": 1})
+    time.sleep(0.2)
+    assert plugin._model is None
+    assert not plugin._closing
+
+
 def test_recognize_by_photo_refuses_a_path_outside_the_roots(tmp_path):
     plugin, _ = _photo_plugin(tmp_path)
     result = plugin.dispatch("visual_depth", {

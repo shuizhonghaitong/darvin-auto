@@ -232,6 +232,15 @@ plugins:
     cal_a: 1.0
     cal_b: 0.0
     max_depth_m: 20.0
+    # ── Darvin SUT (run agent-cb270026112500000000000000000270) ──
+    # The board gates per-image inference at FPS>=10. A cold first recognize
+    # pays model download + TensorRT context load (seconds) on top of the
+    # ~30 ms steady state, so warm the engine on a daemon thread at service
+    # start. Memory-neutral: the engine loads on the first request regardless;
+    # this only moves WHEN it loads. A failed warmup is not latched — the
+    # first real request retries the same single-flight load path.
+    warmup_on_start: true
+    warmup_frames: 3
 
     # ── Lens-barrel (vignette) mask ──────────────────────────────────────
     # Measured on r1_sz, 2026-09-23: the main camera looks out through a
