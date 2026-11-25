@@ -376,6 +376,21 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            # Darwin SUT chart readiness/liveness probe (GET /ready on the
+            # service port). The service is ready as soon as this HTTP server is
+            # listening; the pose engines load lazily on first use, so nothing
+            # else gates readiness. Echo the active plugin set so a config
+            # regression (a heavy plugin re-enabled) is visible in /ready output.
+            if self.path.split("?")[0] in ("/ready", "/health", "/healthz"):
+                try:
+                    plugins = sorted(
+                        {p.PREFIX for p in (getattr(_bundle, "_plugins", []) or [])}
+                    ) if _bundle is not None else []
+                except Exception:
+                    plugins = []
+                self._send(200, json.dumps(
+                    {"status": "ready", "ok": True, "plugins": plugins}))
+                return
             if self.path in ("/vad/test", "/tts/test"):
                 self._send(405, '{"error":"Use POST"}')
                 return
