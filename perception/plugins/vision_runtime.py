@@ -494,6 +494,10 @@ def imdecode_bytes(data: bytes) -> Optional[np.ndarray]:
             return np.ascontiguousarray(rgb[:, :, ::-1])
         except ImportError:
             pass
+        except Exception:
+            # Corrupt or non-image bytes: a decode failure (the caller answers
+            # ok:false bad_input), never an exception at the MCP layer.
+            return None
     import cv2
     return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 

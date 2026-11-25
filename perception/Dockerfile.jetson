@@ -94,20 +94,20 @@ print('[build] lean deps ok:', numpy.__version__, PIL.__version__)"
 # if it fails, the runtime falls back to the reference COS bundle (the
 # 144-class prebuilt engine), so a flaky network at build time degrades
 # accuracy instead of breaking the build.
-ARG VOP_ONNX_SHA256=84795e32dbd77b69e5754518d043cac8295da2fbe7f9c9c3728501dcefc29763
-ARG VOP_VOCAB_SHA256=8b9f2b73bdcc92db3235fe1077cbe092377f37129031355e746fe652b8a8a8a7
+ARG VOP_ONNX_SHA256=65fa109b0ccc8f1748458a7134d1c4b6d71ee60a3cf9112c4d9333085e870f70
+ARG VOP_VOCAB_SHA256=7dfc0fae36eb34f6205af1994fb3a24a8a853ba478fd8dad55fe64fec747b707
 RUN set -x; \
     mkdir -p /opt/vop-models && \
     python3 - <<'PY' || echo "[build] vop light model NOT baked — runtime will use the reference bundle"
 import hashlib, json, sys, urllib.request
 
-base = "https://github.com/shuizhonghaitong/darvin-auto/releases/download/agent-fa294026112500000000000000000294-vop-models-v1"
+base = "https://github.com/shuizhonghaitong/darvin-auto/releases/download/agent-cb294026112500000000000000000294-vop-models-v1"
 pins = {
-    "vop220-yoloe-26n-seg.onnx": "84795e32dbd77b69e5754518d043cac8295da2fbe7f9c9c3728501dcefc29763",
-    "vocab220.json": "8b9f2b73bdcc92db3235fe1077cbe092377f37129031355e746fe652b8a8a8a7",
+    "vop220.onnx": "65fa109b0ccc8f1748458a7134d1c4b6d71ee60a3cf9112c4d9333085e870f70",
+    "vocab220.json": "7dfc0fae36eb34f6205af1994fb3a24a8a853ba478fd8dad55fe64fec747b707",
 }
 dest = {
-    "vop220-yoloe-26n-seg.onnx": "/opt/vop-models/vop220.onnx",
+    "vop220.onnx": "/opt/vop-models/vop220.onnx",
     "vocab220.json": "/opt/vop-models/vocab220.json",
 }
 for name, want in pins.items():

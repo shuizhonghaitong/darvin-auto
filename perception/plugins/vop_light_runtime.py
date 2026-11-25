@@ -8,7 +8,9 @@ engine) is a heavy accelerator context on the shared Jetson Orin box: several
 concurrent instances OOM the 8 GB unified memory (exit 137). This module loads
 the light path instead:
 
-  baked ONNX (YOLOE-26n-seg, 220 competition classes, nms=False, 640x640)
+  pinned ONNX (YOLOE-26s-seg, 220 competition classes, nms=False, 640x640;
+  image-baked at /opt/vop-models when present, otherwise fetched at start
+  from the run's pinned GitHub release by plugins/vop_model_bootstrap.py)
     -> runtime TensorRT build, static shapes, FP16, capped workspace
     -> cached engine (file-locked) so only the first instance pays the build
     -> run through utils.tensorrt_runtime.TensorRTEngine (unchanged reference
@@ -48,15 +50,41 @@ def light_path_enabled() -> bool:
     return os.environ.get("VOP_LIGHT", "1").strip() not in ("0", "false", "off", "")
 
 
+def _bootstrap_assets() -> dict[str, str] | None:
+    """Fetch the pinned release assets (ONNX + vocab) into a local dir.
+
+    Only attempted when neither the env override nor the image-baked default
+    is present, i.e. under the official sut shell image, which is a fixed
+    upstream artifact and therefore carries no model of its own.
+    """
+    from plugins.vop_model_bootstrap import ensure_assets
+    return ensure_assets()
+
+
 def find_onnx() -> str | None:
     path = os.environ.get("VOP_ONNX_PATH", "").strip() or DEFAULT_ONNX_PATH
     if os.path.isfile(path):
         return path
+    assets = _bootstrap_assets()
+    if assets and os.path.isfile(assets.get("vop220.onnx", "")):
+        return assets["vop220.onnx"]
     return None
 
 
-def find_vocab() -> list[str]:
+def _vocab_path() -> str:
     path = os.environ.get("VOCAB_PATH", "").strip() or DEFAULT_VOCAB_PATH
+    if os.path.isfile(path):
+        return path
+    if not os.path.isfile(DEFAULT_ONNX_PATH) and not os.environ.get("VOP_ONNX_PATH", "").strip():
+        assets = _bootstrap_assets()
+        candidate = (assets or {}).get("vocab220.json", "")
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return path
+
+
+def find_vocab() -> list[str]:
+    path = _vocab_path()
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
@@ -136,7 +164,8 @@ def _set_workspace_limit(config, trt, workspace_bytes: int):
 
 
 def _write_engine_with_metadata(serialized: bytes, names: list[str], imgsz: int,
-                                onnx_sha: str, dest: str):
+                                onnx_sha: str, dest: str,
+                                model_name: str = "vop220"):
     """Serialize the ultralytics-style JSON header the reference reader expects.
 
     read_engine_file() accepts a plain engine, but with the header
@@ -146,7 +175,7 @@ def _write_engine_with_metadata(serialized: bytes, names: list[str], imgsz: int,
     """
     metadata = {
         "task": "detect",
-        "name": "vop220-yoloe-26n-seg",
+        "name": model_name,
         "imgsz": [imgsz, imgsz],
         "end2end": True,
         "nms": False,
@@ -234,7 +263,8 @@ def ensure_light_engine(onnx_path: str, names: list[str], imgsz: int = 640) -> s
                  build_seconds, len(data) / 1e6)
 
         tmp_path = engine_path + f".tmp-{os.getpid()}"
-        _write_engine_with_metadata(data, names, imgsz, onnx_sha, tmp_path)
+        model_name = os.path.splitext(os.path.basename(onnx_path))[0]
+        _write_engine_with_metadata(data, names, imgsz, onnx_sha, tmp_path, model_name)
         os.replace(tmp_path, engine_path)
         with open(done_path, "w") as handle:
             json.dump({"onnx_sha256": onnx_sha, "trt": version, "imgsz": imgsz,
