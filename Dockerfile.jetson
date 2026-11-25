@@ -1,5 +1,5 @@
 # Darwin subnet 273 (1000000273) 具身智能-TTS基础能力-不限音色榜v5 (多语种 jp5,6)
-# Jetson JP6 target (JP_VERSION=6) — run id agent-d2732026112400000000000000000273
+# Jetson JP6 target (JP_VERSION=6) — run id agent-fa273026112500000000000000000273
 #
 # Delivery: github-commit. The platform runs the official sut shell
 # (harbor-contest.4pd.io/wanglimin/sut/robot_tts:0.0.4) which clones this repo
@@ -20,7 +20,12 @@ WORKDIR /work
 #  - GET /ready + GET / (sut chart readiness probe: curl -s -f localhost:80/ready),
 #  - /tts/test optional per-case language field,
 #  - per-utterance language detection in plugins/tts.py (kokoro-multi),
-#  - config.yaml: engine kokoro-multi, device gpu, TTS-only plugin set.
+#  - config.yaml: engine kokoro-multi, device gpu, TTS-only plugin set,
+#    japanese_worker disabled (no second CUDA context per instance),
+#  - bounded long-text synthesis in plugins/tts.py (<=280-char segments on the
+#    raw /tts/test path — prior 3-instance evaluation OOM'd on 800+ char cases),
+#  - start.sh: OMP/BLAS thread caps + CUDA_MODULE_LOADING=LAZY + defensive
+#    MCP_PORT=80/WS_PORT=15721 defaults for the sut probe contract.
 COPY perception/ /work/perception/
 COPY start.sh /work/start.sh
 RUN chmod +x /work/start.sh

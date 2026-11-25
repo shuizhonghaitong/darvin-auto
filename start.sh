@@ -41,4 +41,21 @@ if [ -f /etc/dla-fallback.env ]; then
 fi
 set -u
 
+# Port contract: the sut chart probes http://localhost:80/ready. main.py reads
+# MCP_PORT/WS_PORT from the environment (official template requirement); the
+# :-defaults only fill in when the shell did not export them, so a shell that
+# pins different ports is never overridden.
+export MCP_PORT="${MCP_PORT:-80}"
+export WS_PORT="${WS_PORT:-15721}"
+
+# Bounded per-instance footprint: the platform evaluates up to 3 service
+# instances concurrently on the shared-memory Orin, so each process caps its
+# CPU thread pools (matches the config's own num_threads: 2 guidance) and uses
+# lazy CUDA module loading to keep the context's init-time memory low. Only
+# applied when the shell has not set them.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+
 exec python3 "$MAIN_PY"

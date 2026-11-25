@@ -21,7 +21,7 @@ plugins:
     enabled: false  # Darvin TTS board: TTS-only evaluation; no music library needed
 
   audio_mixer:
-    enabled: true
+    enabled: false  # Darvin TTS board: TTS-only evaluation; no background-mixing card needed
     # auto = 问本进程里的 TTS 插件它在发哪个话题。接到本卡的其余输入都算背景音乐。
     speech_topics: auto
     duck_gain: 0.15
@@ -125,7 +125,12 @@ plugins:
     # what shipped before the worker existed. `japanese_worker_device: cpu` keeps the
     # process boundary but not the GPU; both are safe, because a CPU-only session
     # never loads the CUDA provider and so never touches the shared bridge.
-    japanese_worker: true
+    japanese_worker: false  # Darvin TTS board: the worker subprocess would add a SECOND
+    # CUDA context per instance (kokoro_worker.py records a no-headroom CUDA
+    # allocation taking the whole box out: OOM, SIGKILL). Japanese then runs on
+    # the documented-safe in-process CPU session (KokoroDirect, provider=cpu —
+    # it never touches the shared CUDA provider bridge), chunked at
+    # KOKORO_JA_CHUNK_TOKENS, same model, same audio, RTF ~0.5 (real time).
     japanese_worker_device: gpu
     # matcha-zh-en / mms-th / kokoro-multi only — vits2-zh-en runs on TensorRT and
     # ignores this. Matcha is fp32, so both devices load the same weights and only
@@ -440,7 +445,7 @@ plugins:
   # 默认开着：这张卡不加载任何模型、不占显存，没被拖到画布上连线时什么都不做。
   # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
   echo_cancellation:
-    enabled: true
+    enabled: false  # Darvin TTS board: TTS-only evaluation; mic/AEC chain not under test
     # auto = 问本进程里的 TTS 插件它正在发哪个 topic。几乎总是对的；只有 TTS 在
     # 别的容器里才需要在这里写死一个 topic 名（写死的值在卡片下拉框里也保留）。
     # 这是卡片上**唯一**的设置项。

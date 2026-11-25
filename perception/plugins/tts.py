@@ -93,6 +93,62 @@ _LOW_LAT_QOS = QoSProfile(
 )
 
 
+# ── Long-text memory bound ────────────────────────────────────────────────────
+# The raw synthesis path (POST /tts/test -> synthesize_raw) used to hand the
+# entire text to one kokoro generate(), whose autoregressive activations scale
+# with the token count of the input. On the shared-memory Orin, several
+# concurrently evaluated instances each synthesizing 800+ char cases exhausted
+# RAM (OOM, exit 137) before any audio was returned. Every segment below is at
+# most RAW_SYNTH_MAX_CHARS, so the per-call peak is constant no matter how long
+# the input is — the same 280-char bound the ROS worker path has always used.
+RAW_SYNTH_MAX_CHARS = 280
+
+
+def _bounded_segments(text: str, max_chars: Optional[int] = None) -> list:
+    """Split text into segments of at most max_chars for bounded-memory synthesis.
+
+    Sentence punctuation (CJK 。！？； and Latin !? and newlines) is the
+    preferred boundary; a span still longer than the cap is hard-split — on a
+    space for Latin text, by character count otherwise — so the cap holds for
+    arbitrarily long, even punctuation-free, input. "." is deliberately NOT a
+    boundary: the dataset contains units and formulas, and "3.14" must not be
+    broken into "3." and "14".
+    """
+    if not text:
+        return []
+    if max_chars is None:
+        max_chars = RAW_SYNTH_MAX_CHARS
+    if max_chars <= 0:
+        return [text]
+    parts = [p for p in re.split(r'(?<=[。！？；!?\n])', text) if p != '']
+    if not parts:
+        return [text]
+    segments: list = []
+    current = ''
+
+    def _flush():
+        nonlocal current
+        if current:
+            segments.append(current)
+            current = ''
+
+    for part in parts:
+        while len(part) > max_chars:
+            _flush()
+            cut = part.rfind(' ', 1, max_chars)
+            if cut < max_chars // 2:
+                cut = max_chars
+            segments.append(part[:cut])
+            part = part[cut:].lstrip()
+        if not part:
+            continue
+        if current and len(current) + len(part) > max_chars:
+            _flush()
+        current += part
+    _flush()
+    return segments or [text]
+
+
 def _agent_core_url() -> str:
     import os
     return os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
@@ -1610,22 +1666,8 @@ class _TTSNode(Node):
 
     @staticmethod
     def _split_text(text: str, max_chars: int = 280) -> list:
-        """按标点分段，每段不超过 max_chars 字。"""
-        import re as _re
-        sentences = _re.split(r'(?<=[。！？；\n])', text)
-        segments = []
-        current = ""
-        for sent in sentences:
-            if not sent:
-                continue
-            if len(current) + len(sent) > max_chars and current:
-                segments.append(current)
-                current = sent
-            else:
-                current += sent
-        if current:
-            segments.append(current)
-        return segments if segments else [text]
+        """按标点分段，每段不超过 max_chars 字（超长片段强制再切分）。"""
+        return _bounded_segments(text, max_chars)
 
     def _text_cb(self, msg: String):
         if self.state != "running": return
@@ -2262,10 +2304,22 @@ class SherpaOnnxTTSPlugin:
         return None
 
     def synthesize_raw(self, text: str) -> bytes:
-        """Synthesize text and return raw PCM bytes (16kHz 16-bit mono)."""
+        """Synthesize text and return raw PCM bytes (16kHz 16-bit mono).
+
+        Long input is segmented first (see _bounded_segments): one generate()
+        per <= RAW_SYNTH_MAX_CHARS segment, so the per-call inference peak is
+        constant for arbitrarily long texts. Text that fits one segment takes
+        exactly the original single-shot path. The returned PCM is the full
+        utterance, contract unchanged.
+        """
         if not self._adapter:
             raise RuntimeError("TTS adapter not configured")
-        return self._adapter.synthesize(text)
+        segments = _bounded_segments(text)
+        if len(segments) == 1:
+            return self._adapter.synthesize(segments[0])
+        log.info("[tts] raw synthesis bounded: %d chars -> %d segments "
+                 "(max %d each)", len(text), len(segments), RAW_SYNTH_MAX_CHARS)
+        return b"".join(self._adapter.synthesize(seg) for seg in segments)
 
 
 DEFAULT_TTS_ENGINE = "vits2-zh-en"
