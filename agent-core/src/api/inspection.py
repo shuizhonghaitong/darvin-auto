@@ -1,0 +1,334 @@
+"""
+inspection.py — DDS topic monitoring & WebSocket relay, embedded in agent-core.
+
+Previously a separate `dds_inspection` service; merged here to eliminate the proxy hop.
+
+HTTP endpoints (mounted under /api via start.py):
+  POST /monitor/start      — (legacy, no-op) 保留兼容
+  POST /monitor/stop       — (legacy, no-op) 保留兼容
+  GET  /monitor            — 返回当前监控状态（是否有活跃订阅）
+  POST /topics/register    — 注册 topic
+  GET  /topics             — 返回已注册 topic 列表（含 status）
+  GET  /topics/status      — 返回 {topic: status} 字典
+
+WebSocket endpoint (mounted on root app in start.py):
+  WS   /ws/bus/{topic:path}  — 订阅并实时推送该 topic 的数据帧（按需自动启动 DDS 订阅）
+"""
+
+import asyncio
+import json
+import time
+
+import fastapi
+
+import ros2_bridge
+
+router    = fastapi.APIRouter(tags=['inspection'])
+ws_router = fastapi.APIRouter(tags=['inspection'])
+
+# ── Module-level state ─────────────────────────────────────────────────────────
+
+# topic → {format, mcp_id, registered_at}
+_topic_registry: dict[str, dict] = {}
+
+# per-topic fan-out queues: topic → list of asyncio.Queue (one per WS consumer)
+_topic_queues: dict[str, list] = {}
+
+# Active primary subscriptions (topic paths with live DDS sub)
+_active_primary_subs: set[str] = set()
+
+# Collisions already reported, so a rejected producer that keeps re-registering
+# on every heartbeat says so once rather than every few seconds.
+_logged_topic_collisions: set[tuple] = set()
+
+# Last frame cache per topic (for initial snapshot push on new WS connect)
+_last_frame: dict[str, bytes] = {}
+
+
+# ── Status helpers ─────────────────────────────────────────────────────────────
+
+def _topic_status(topic: str) -> str:
+    if topic in _active_primary_subs:
+        if time.time() - ros2_bridge.get_last_seen(topic) < 10:
+            return 'active'
+        return 'online'
+    if topic in ros2_bridge.get_dds_topics():
+        return 'online'
+    return 'offline'
+
+
+# ── Primary subscription management ──────────────────────────────────────────
+
+def _push_factory(topic: str):
+    """Create a push callback for a topic that fans out to all WS consumers."""
+    _push_count = [0]
+    async def _push(data: bytes, msg_fmt: str):
+        # Cache latest frame for snapshot push on new connections
+        _last_frame[topic] = data
+        queues = _topic_queues.get(topic, [])
+        _push_count[0] += 1
+        if topic == '/remote_control/mic' and _push_count[0] <= 5:
+            print(f'[inspection] DEBUG push #{_push_count[0]} to {topic}: {len(data)}B, {len(queues)} consumers')
+        for q in list(queues):
+            try:
+                q.put_nowait(data)
+            except asyncio.QueueFull:
+                pass  # drop frame for slow consumer
+        # 处理 perf_span 类型消息（来自 perception TTS 等组件）
+        if topic == '/perception/perf_spans':
+            try:
+                import json
+                text = data.decode('utf-8') if isinstance(data, bytes) else data
+                span_data = json.loads(text)
+                if span_data.get('type') == 'perf_span':
+                    # commit_spans and the fallback lookup are both synchronous
+                    # SQLite. Running them here blocked the event loop — and so
+                    # every audio WS send on it — once per utterance, exactly at
+                    # the utterance boundary where playback is most sensitive.
+                    await asyncio.to_thread(_commit_perf_span, span_data)
+            except Exception:
+                pass
+    return _push
+
+
+def _commit_perf_span(span_data: dict) -> None:
+    """Attribute one perception perf span to a trace. Blocking; off-loop only."""
+    import perf_log, config
+    trace_id = span_data.pop('trace_id', None)
+    if trace_id:
+        # 直接归属（trace_id 由 agent-core 透传）
+        perf_log.commit_spans(trace_id, [span_data], source='perception')
+        return
+    # 兼容旧版本 perception: fallback 到时间窗口匹配
+    span_start = span_data.get('start_ts', 0)
+    # 这个连接是本线程共享的（见 config._get_conn），关掉会连带断了别人的读。
+    row = config._get_conn().execute(
+        '''SELECT trace_id FROM perf_spans
+           WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
+           ORDER BY start_ts DESC LIMIT 1''',
+        (span_start, span_start)
+    ).fetchone()
+    if row:
+        perf_log.commit_spans(row[0], [span_data], source='perception')
+
+
+def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
+    """Start primary ROS2 subscription only if not already active."""
+    key = f'__primary__#{topic}'
+
+    if topic in _active_primary_subs:
+        return  # already subscribed
+
+    _active_primary_subs.add(topic)  # mark immediately to prevent race
+    ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
+    print(f'[inspection] started primary sub: {topic}')
+
+
+# ── Internal API (called by mcp_manage directly) ───────────────────────────────
+
+async def register_topic_internal(topic: str, fmt: str, mcp_id: str,
+                                  producer: bool = True) -> None:
+    """Register a topic in the registry; always check primary sub health.
+
+    `producer=False` 表示这是消费者声明的输入（topic_in）：它只说明「我想吃什么格式」，
+    不能改写别人发布的总线格式。一个 topic 的格式由发布方说了算 —— 它决定了 DDS 订阅用
+    哪种消息类型（ros2_bridge._resolve_msg_type）和仪表盘挑哪个渲染器，被消费者改掉会
+    让整条总线读不出数据。
+    """
+    if not topic:
+        return
+    existing = _topic_registry.get(topic)
+    # Two *producers* claiming one topic under different formats. The
+    # consumer rule below cannot catch this — both sides are publishers, and
+    # each was simply overwriting the other.
+    #
+    # Nothing rate-limited that. On Tianyi the driver's own `camera_depth`
+    # published `/nvidia_desktop/camera/head/depth` as image/depth-z16 while
+    # perception's visual_depth derived the same name for its image/depth-zlib
+    # output, and the two took turns re-registering it. Every flip tore the
+    # subscription down and rebuilt it against a message type the other
+    # producer was not sending, so rclpy refused it as an incompatible type on
+    # an existing topic name. 303 rebuilds later the dashboard had still never
+    # received a frame — while both producers were publishing perfectly well.
+    # It presented as one of them being stuck on its first frame.
+    #
+    # First claim wins. A collision is a naming bug that has to be fixed at the
+    # source, and until it is, a panel that works for one of the two beats a
+    # panel that works for neither.
+    if existing and producer and \
+            existing.get('mcp_id') != mcp_id and existing.get('format') != fmt:
+        key = (topic, existing.get('mcp_id'), mcp_id, fmt)
+        if key not in _logged_topic_collisions:
+            _logged_topic_collisions.add(key)
+            print(f'[inspection] TOPIC COLLISION on {topic}: kept '
+                  f'{existing.get("format")!r} from {existing.get("mcp_id")}, '
+                  f'refused {fmt!r} from {mcp_id}. Two producers are publishing '
+                  f'to one topic under different formats — one of them needs '
+                  f'renaming, and until then the other one is unreadable.')
+        _ensure_primary_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
+        return
+    if existing and not producer:
+        if existing.get('format') != fmt:
+            print(f'[inspection] ignored consumer format {fmt!r} for {topic} '
+                  f'(producer says {existing.get("format")!r}, from {existing.get("mcp_id")})')
+        # 格式不动，但仍要确保订阅健康
+        _ensure_primary_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
+        return
+    if not (existing and existing.get('format') == fmt and existing.get('mcp_id') == mcp_id):
+        # 格式变了 → 订阅要重建：msg type 是按 format 选的，旧订阅还挂在错误的类型上
+        # （例如被消费者污染成 image/jpeg 后，CompressedImage 订阅永远收不到 String 帧）。
+        if existing and existing.get('format') != fmt and topic in _active_primary_subs:
+            print(f'[inspection] {topic} format {existing.get("format")!r} → {fmt!r}, '
+                  f'rebuilding subscription')
+            _active_primary_subs.discard(topic)
+        _topic_registry[topic] = {
+            'format':        fmt,
+            'mcp_id':        mcp_id,
+            'registered_at': time.time(),
+        }
+        print(f'[inspection] registered topic={topic} format={fmt} mcp_id={mcp_id}')
+    # Always check health of primary sub (even on duplicate registration)
+    loop = asyncio.get_event_loop()
+    _ensure_primary_sub(topic, fmt, loop)
+
+
+async def publish_to_topic(topic: str, data: str | bytes) -> None:
+    """Publish data to a topic via DDS (ros2_bridge).
+    Data reaches dashboard via DDS → inspection primary sub → WebSocket.
+    Data reaches decision_core via DDS → topic_subscriber → event_bus."""
+    if topic not in _topic_registry:
+        await register_topic_internal(topic, 'data/json', 'agentcore')
+    text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+
+    # Publish to DDS — inspection sub will push to WebSocket, topic_subscriber to event_bus
+    import ros2_bridge
+    ros2_bridge.publish(topic, text)
+
+
+# ── HTTP: Monitor (legacy, kept for compatibility) ────────────────────────────
+
+@router.post('/monitor/start')
+async def monitor_start():
+    # Legacy no-op: subscriptions are now managed automatically per-consumer.
+    return {'code': 200, 'message': 'auto-managed'}
+
+
+@router.post('/monitor/stop')
+async def monitor_stop():
+    # Legacy no-op: primary subs stay alive as long as topic is registered.
+    return {'code': 200, 'message': 'auto-managed'}
+
+
+@router.get('/monitor')
+async def monitor_status():
+    return {'code': 200, 'data': {'monitoring': len(_active_primary_subs) > 0}}
+
+
+# ── HTTP: Topics ───────────────────────────────────────────────────────────────
+
+@router.post('/topics/register')
+async def register_topic(payload: dict):
+    topic     = payload.get('topic', '').strip()
+    fmt       = payload.get('format', '')
+    mcp_id    = payload.get('mcp_id', '')
+    if not topic:
+        raise fastapi.HTTPException(status_code=400, detail='topic is required')
+    await register_topic_internal(topic, fmt, mcp_id)
+    return {'code': 200, 'topic': topic}
+
+
+@router.get('/topics')
+async def list_topics():
+    items = [
+        {'topic': t, **info, 'status': _topic_status(t)}
+        for t, info in _topic_registry.items()
+    ]
+    return {'code': 200, 'data': items}
+
+
+@router.get('/topics/status')
+async def topics_status():
+    data = {t: _topic_status(t) for t in _topic_registry}
+    return {'code': 200, 'data': data}
+
+
+@router.get('/topics/subscriptions')
+async def topics_subscriptions():
+    """Debug: 返回当前 topic_subscriber 的实际订阅列表和 config 中的 subscribe_topics。"""
+    import topic_subscriber
+    import config as cfg
+    return {
+        'code': 200,
+        'data': {
+            'active_subscriptions': list(topic_subscriber._subscriptions.keys()),
+            'config_subscribe_topics': cfg.main.get('event', {}).get('subscribe_topics', []),
+        }
+    }
+
+
+# ── WebSocket relay ────────────────────────────────────────────────────────────
+
+@ws_router.websocket('/ws/bus/{topic:path}')
+async def bus_ws(websocket: fastapi.WebSocket, topic: str):
+    await websocket.accept()
+
+    topic = '/' + topic  # restore leading /
+
+    info = _topic_registry.get(topic)
+    if not info:
+        await websocket.send_text(json.dumps({
+            'type':    'error',
+            'message': f'Topic {topic} not registered',
+        }))
+        await websocket.close()
+        return
+
+    fmt = info['format']
+    loop = asyncio.get_event_loop()
+
+    # Ensure DDS subscription is active (no-op if already running)
+    _ensure_primary_sub(topic, fmt, loop)
+
+    await websocket.send_text(json.dumps({
+        'type':   'meta',
+        'ts':     time.time(),
+        'topic':  topic,
+        'format': fmt,
+    }))
+
+    # Push cached snapshot immediately (so page refresh shows current map)
+    snapshot = _last_frame.get(topic)
+    if snapshot:
+        if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+            await websocket.send_bytes(snapshot)
+        elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
+            await websocket.send_text(snapshot.decode('utf-8', errors='replace'))
+        else:
+            await websocket.send_bytes(snapshot)
+
+    q: asyncio.Queue = asyncio.Queue(maxsize=4096)
+    _topic_queues.setdefault(topic, []).append(q)
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(q.get(), timeout=5.0)
+                if data is None:
+                    break  # signal to stop
+                if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+                    await websocket.send_bytes(data)
+                elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
+                    await websocket.send_text(data.decode('utf-8', errors='replace'))
+                else:
+                    await websocket.send_bytes(data)
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_text(json.dumps({'type': 'ping', 'ts': time.time()}))
+                except Exception:
+                    break
+    except (fastapi.WebSocketDisconnect, asyncio.CancelledError, Exception):
+        pass
+    finally:
+        queues = _topic_queues.get(topic, [])
+        if q in queues:
+            queues.remove(q)
