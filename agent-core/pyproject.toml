@@ -1,0 +1,34 @@
+[project]
+name = "code-head"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "aiohttp>=3.13.5",
+    "docker>=7.1.0",
+    "fastapi[all]>=0.135.3",
+    "html2text>=2024.2.26",
+    "jsonschema>=4.0",
+    "numpy>=1.24",
+    "openai>=2.31.0",
+    "pyyaml>=6.0.2",
+    "lark-oapi>=1.4.0",
+    "python-telegram-bot>=21.0",
+    "slack-sdk>=3.27",
+    "qqbot-agent-sdk==1.2.2",
+    "qrcode>=7.4.2",
+    "zeroconf>=0.136.0",
+    "bleak>=0.21.0",
+]
+
+# BLE *advertising* (peripheral mode) is deliberately NOT declared here.
+# `uv lock` resolves every declared extra, so a Linux-only, pre-1.0 package
+# would break the image build for everyone — including the ARM64 robots that
+# will never advertise over BLE. peer/ble_advertiser.py imports it lazily and
+# degrades to scan-only when absent; install it by hand on hosts that need it:
+#     pip install bluez-peripheral
+# See docs/PEER_SETUP.md § "Optional: BLE Advertising".
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+default = true
