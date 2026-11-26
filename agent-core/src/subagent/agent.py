@@ -1,0 +1,882 @@
+"""
+agent.py — Subagent class with isolated LLM loop.
+
+Each subagent runs its own multi-round reasoning loop with:
+- Isolated context (own history, compression)
+- Filtered tool access (no nesting, no memory/task management)
+- Checkpoint/resume support
+- Cancel/pause signals
+"""
+
+from __future__ import annotations
+import asyncio
+import fnmatch
+import json
+import time
+import typing
+from uuid import uuid4
+
+import mcp_client
+from .protocol import (
+    SubagentSpec, SubagentResult, SubagentStatus,
+    STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED,
+    STATUS_TIMEOUT, STATUS_CANCELLED, STATUS_PAUSED, STATUS_SUSPENDED,
+    STATUS_PARTIAL,
+)
+from .context import SubagentContext
+
+
+# Used only when a spec reaches here without the manager having resolved the
+# config sentinels (max_rounds=0 / timeout_s<0) — a spec rebuilt from a dict, say.
+# Never the configured defaults; those live in config and manager._get_config().
+_FALLBACK_MAX_ROUNDS = 50
+_FALLBACK_TIMEOUT_S = 600.0
+
+
+# Tools that subagents are NEVER allowed to use (enforced at code level)
+_DENIED_TOOLS = {
+    'subagent_spawn', 'subagent_spawn_sync', 'subagent_status',
+    'subagent_cancel', 'subagent_message', 'subagent_result',
+    'update_memory', 'activate_skill', 'deactivate_skill',
+    'task_create', 'task_update', 'task_done', 'task_fail',
+    'schedule_create', 'schedule_cancel',
+}
+
+
+class Subagent:
+    """An isolated agent instance with its own LLM loop and context."""
+
+    def __init__(self, spec: SubagentSpec, agent_id: str | None = None,
+                 compress_threshold: int = 40000):
+        self.id = agent_id or uuid4().hex[:8]
+        # Resolve before building the context: the system prompt states the round
+        # budget, and `range(0)` would otherwise exit the loop before round 0.
+        if spec.max_rounds <= 0:
+            spec.max_rounds = _FALLBACK_MAX_ROUNDS
+        if spec.timeout_s < 0:
+            spec.timeout_s = _FALLBACK_TIMEOUT_S
+        self.spec = spec
+        self.status: str = 'pending'
+        self.created_at: float = time.time()
+        self.updated_at: float = time.time()
+        self.rounds_completed: int = 0
+        self.result: SubagentResult | None = None
+
+        # Chat-history mirror. Turns are written as they finish rather than in one
+        # batch at completion — a background agent that runs for minutes was
+        # invisible in the history modal for its whole life otherwise. The index is
+        # its own counter because context.turns gets compacted under it.
+        self.history_session_id: str | None = None
+        self._history_turn_index = 0
+
+        # Context isolation
+        self._context = SubagentContext(spec, compress_threshold)
+        self._inbox: asyncio.Queue = asyncio.Queue(maxsize=16)
+
+        # Control signals
+        self._cancel_event = asyncio.Event()
+        self._pause_event = asyncio.Event()
+        self._cancel_reason: str = ''
+
+        # Tracking
+        self._tool_calls_made: list[dict] = []
+        self._progress_reports: list[str] = []
+        # ACP action_ids this run started, in order. A tool call that *begins* an
+        # asynchronous action is not evidence the action happened — the terminal
+        # state has to be looked up afterwards (mcp_client.action_outcome). This is
+        # what lets a delegator tell "spoke the line" from "queued it and the
+        # callback never came".
+        self._action_ids: list[str] = []
+
+    @property
+    def context(self) -> SubagentContext:
+        return self._context
+
+    def persist_turn(self, messages: list[dict]) -> None:
+        """Append one finished round to this agent's chat-history session."""
+        if not messages:
+            return
+        try:
+            import chat_history
+            if not self.history_session_id:
+                kind = (chat_history.KIND_BG_SUBAGENT
+                        if self.spec.goal.startswith('[bg]')
+                        else chat_history.KIND_SUBAGENT)
+                self.history_session_id = chat_history.create_session(kind)
+                chat_history.update_summary(
+                    self.history_session_id,
+                    f'[subagent:{self.id}] {self.spec.goal[:80]}',
+                )
+            chat_history.save_turn(
+                self.history_session_id, self._history_turn_index, messages)
+            self._history_turn_index += 1
+        except Exception as e:
+            print(f'[subagent:{self.id}] save history failed: {e}')
+
+    def get_status(self) -> SubagentStatus:
+        return SubagentStatus(
+            id=self.id,
+            goal=self.spec.goal,
+            status=self.status,
+            priority=self.spec.priority,
+            model=self.spec.model,
+            rounds_completed=self.rounds_completed,
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+        )
+
+    def send_message(self, text: str) -> None:
+        """Queue a message from the parent agent."""
+        try:
+            self._inbox.put_nowait({'text': text, 'ts': time.time()})
+        except asyncio.QueueFull:
+            pass  # drop if inbox full
+
+    def cancel(self, reason: str = '') -> None:
+        """Signal cancellation.
+
+        `reason` is recorded and logged. Cancelling a running subagent used to be
+        entirely silent — neither this nor the branch in `run()` that acts on the
+        signal printed anything — so a cancelled agent's log ended mid-run with no
+        explanation, which reads identically to a hang.
+        """
+        self._cancel_reason = reason
+        print(f'[subagent:{self.id}] cancel signalled'
+              f'{f": {reason}" if reason else ""}')
+        self._cancel_event.set()
+
+    def pause(self) -> None:
+        """Signal pause (for voluntary pause or preemption)."""
+        self._pause_event.set()
+
+    # ── Tool Filtering ─────────────────────────────────────────────────────────
+
+    def _get_allowed_tools(self) -> list[dict]:
+        """Build tool list for this subagent based on spec filters."""
+        # Get all bound tools from canvas (same as main agent sees)
+        all_schemas = self._get_all_mcp_schemas()
+
+        # Also include desktop tools (system tools available to subagents)
+        all_schemas.extend(self._get_desktop_tool_schemas())
+
+        # Apply whitelist filter
+        if self.spec.tool_filter is not None:
+            filtered = []
+            for schema in all_schemas:
+                name = schema.get('name', '')
+                if any(fnmatch.fnmatch(name, pat) for pat in self.spec.tool_filter):
+                    filtered.append(schema)
+            all_schemas = filtered
+
+        # Apply blacklist deny
+        if self.spec.tool_deny:
+            all_schemas = [
+                s for s in all_schemas
+                if not any(fnmatch.fnmatch(s.get('name', ''), pat) for pat in self.spec.tool_deny)
+            ]
+
+        # Remove absolutely denied tools
+        all_schemas = [s for s in all_schemas if s.get('name', '') not in _DENIED_TOOLS]
+
+        # Add subagent-specific system tools
+        sys_tools = self._build_subagent_sys_tools()
+
+        tool_list = (
+            [{'type': 'function', 'function': s} for s in sys_tools]
+            + [{'type': 'function', 'function': s} for s in all_schemas]
+        )
+        return tool_list
+
+    def _get_all_mcp_schemas(self) -> list[dict]:
+        """Get all online MCP tool schemas (unfiltered by canvas binding for subagent).
+
+        A subagent working on a *peer's* behalf (hop_count > 0) does not get peer
+        tools. It was asked to do something **here**; reaching back out to another
+        robot's hardware is a trust inversion — the delegator's actuator moves
+        without the delegator's own agent deciding — and it produces nonsense.
+
+        Observed on Orin6: asked to be the straight man in a comedy routine, the
+        delegated subagent picked `mcp__peer:dd398c73177a__tts` — *Orin5's* mouth —
+        to deliver its line, so Orin5's speaker said "你好Orin5，我是Orin6". From the
+        room it sounds exactly like one robot repeating the other's words. Its own
+        `tts` and the peer's are two entries in the same flat list with near-identical
+        descriptions, so there was nothing to tell it apart by.
+
+        Chained delegation is unaffected: `peer_delegate` stays available (see
+        _get_desktop_tool_schemas) and carries the hop counter and role re-clipping,
+        so handing work onward still works — it just goes through the peer's own agent
+        instead of driving its hardware directly.
+        """
+        from peer import mcp_bridge
+        delegated = getattr(self.spec, 'hop_count', 0) > 0
+        schemas = []
+        for mcp_id, info in mcp_client.registry.items():
+            if not info.get('online'):
+                continue
+            if delegated and mcp_bridge.is_peer_mcp(mcp_id):
+                continue
+            for name, schema in info.get('schemas', {}).items():
+                schemas.append(schema)
+        return schemas
+
+    def _get_desktop_tool_schemas(self) -> list[dict]:
+        """Get desktop tool schemas from the main event loop's sys_tools."""
+        from event.llm import _event_instance
+        if not _event_instance:
+            return []
+        # peer_delegate is inherited deliberately: a chained delegation is
+        # precisely "B was asked to do something and hands part of it to C",
+        # and B's work happens inside a subagent. Without it here the hop
+        # counter that run() publishes would have no caller able to read it,
+        # and chains could only ever be one hop long.
+        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+                          'WebFetch', 'WebSearch', 'memory_recall',
+                          'peer_list', 'peer_state', 'peer_tools', 'peer_call',
+                          'peer_delegate'}
+        # `peer_call` is withheld from a delegated subagent, for the same reason the
+        # peer's MCP tools are (see _get_all_mcp_schemas): it drives another robot's
+        # hardware directly. Removing only the MCP route left this one open, and the
+        # model walked straight through it — asked to be the straight man, Orin6's
+        # delegated subagent called `peer_call(peer="Orin5", tool="tts", ...)` and
+        # then alternated that with its own tts, appointing itself director of both
+        # mouths while Orin5 was still mid-line.
+        #
+        # `peer_delegate` stays: a chained delegation is precisely "B was asked to do
+        # something and hands part of it to C", B's work happens inside a subagent,
+        # and it goes through C's own agent with the hop counter and role re-clipping
+        # intact. Without it here the hop counter run() publishes would have no
+        # caller able to read it and chains could only ever be one hop long.
+        allowed = set(_DESKTOP_TOOLS)
+        if getattr(self.spec, 'hop_count', 0) > 0:
+            allowed.discard('peer_call')
+        from event.desktop import search_configured
+        if not search_configured():
+            allowed.discard('WebSearch')     # 没配搜索引擎就别给，免得一调就报「未配置」
+        return [
+            info['schema']
+            for name, info in _event_instance._sys_tools.items()
+            if name in allowed and name not in _DENIED_TOOLS
+        ]
+
+    def _build_subagent_sys_tools(self) -> list[dict]:
+        """Build the 3 subagent-specific system tools."""
+        return [
+            {
+                'name': 'subagent_finish',
+                'description': '任务完成时调用。output 为最终结果文本。',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'output': {'type': 'string', 'description': '任务结果/输出'},
+                    },
+                    'required': ['output'],
+                },
+            },
+            {
+                'name': 'subagent_fail',
+                'description': '无法完成任务时调用。说明失败原因。',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'reason': {'type': 'string', 'description': '失败原因'},
+                    },
+                    'required': ['reason'],
+                },
+            },
+            {
+                'name': 'subagent_report',
+                'description': '向主代理汇报。默认存入记忆库供按需检索。仅紧急情况（安全/硬件告警）设 urgent=true 立即中断主代理。',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'progress': {'type': 'string', 'description': '进度/结论描述'},
+                        'urgent': {'type': 'boolean', 'description': '是否紧急（默认false存DB，true立即通知主代理）'},
+                    },
+                    'required': ['progress'],
+                },
+            },
+        ]
+
+    # ── LLM Loop ───────────────────────────────────────────────────────────────
+
+    async def run(self, llm_client=None) -> SubagentResult:
+        """Execute the subagent's LLM loop until completion, failure, or interruption.
+
+        Args:
+            llm_client: Deprecated, kept for backward compat. Uses client.call() directly.
+
+        Returns:
+            SubagentResult with final status and output
+        """
+        self.status = STATUS_RUNNING
+        self.updated_at = time.time()
+        t0 = time.time()
+        _trace_id = f'subagent:{self.id}'
+
+        # Publish this agent's peer-hop depth for the duration of the run, so a
+        # peer_delegate call made from inside it reports the real depth instead
+        # of 0. Without this the hop limit would only ever bound the first hop:
+        # every machine in a chain would believe it was the origin.
+        # ContextVars are per-task, so concurrent subagents at different depths
+        # do not interfere.
+        try:
+            from peer.delegation import current_hop_count, current_cancel_event
+            _hop_token = current_hop_count.set(getattr(self.spec, 'hop_count', 0))
+            # Same reasoning, for cancellation: a peer_delegate issued from inside
+            # this subagent must abort when *this* subagent is cancelled, not when
+            # some enclosing turn is.
+            _cancel_token = current_cancel_event.set(self._cancel_event)
+        except ImportError:
+            _hop_token = None
+            _cancel_token = None
+
+        # Own the actions this run starts, so the ordering rule applies within this
+        # subagent's own sequence and not across agents. Without it every subagent
+        # would count as the main loop, and one subagent's speech would again make
+        # every other one wait — the collapse the resource scoping exists to avoid.
+        _ctx_token = mcp_client.current_agent_context.set(f'subagent:{self.id}')
+
+        tool_list = self._get_allowed_tools()
+        finish_output: str | None = None
+        fail_reason: str | None = None
+        _spans = []
+
+        try:
+            for round_idx in range(self.spec.max_rounds):
+                # Check cancel/pause signals
+                if self._cancel_event.is_set():
+                    self.result = SubagentResult(
+                        agent_id=self.id,
+                        status=STATUS_CANCELLED,
+                        output='',
+                        tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
+                        rounds_used=self.rounds_completed,
+                        duration_s=time.time() - t0,
+                        error=self._cancel_reason or 'cancelled',
+                    )
+                    self.status = STATUS_CANCELLED
+                    print(f'[subagent:{self.id}] cancelled at round {round_idx} '
+                          f'after {self.rounds_completed} round(s)'
+                          f'{f": {self._cancel_reason}" if self._cancel_reason else ""}')
+                    return self.result
+
+                if self._pause_event.is_set():
+                    self.status = STATUS_PAUSED if not self._cancel_event.is_set() else STATUS_SUSPENDED
+                    self.updated_at = time.time()
+                    # Return None to indicate pause (manager handles)
+                    return None
+
+                # Drain inbox
+                inbox_msgs = []
+                while not self._inbox.empty():
+                    try:
+                        inbox_msgs.append(self._inbox.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Build messages
+                messages = self._context.build_messages(inbox_msgs if inbox_msgs else None)
+
+                # Call LLM
+                print(f'[subagent:{self.id}] round {round_idx} | msgs={len(messages)} tools={len(tool_list)}')
+                _round_start = time.time()
+
+                try:
+                    import client as _client
+                    response = await _client.call(
+                        message_list=messages,
+                        tool_list=tool_list,
+                        cancel_event=self._cancel_event,
+                        model_override=self.spec.model,
+                        trace_id=_trace_id,
+                        caller_info={'agent_type': 'subagent'},
+                    )
+                    _spans.append({'span': f'llm_round_{round_idx}', 'component': 'subagent',
+                                   'start_ts': _round_start, 'end_ts': time.time()})
+                except Exception as e:
+                    from client.llm import LLMErrorKind, _classify_error
+                    kind, _ = _classify_error(e)
+                    if kind == LLMErrorKind.CONTEXT_OVERFLOW:
+                        # Try compression
+                        await self._context.compress(None, self.spec.model)
+                        continue
+                    raise
+
+                # Process response
+                round_messages = []
+                content = response.get('content', '')
+                tool_calls = response.get('tool_calls', [])
+
+                # Record assistant message
+                assistant_msg = {'role': 'assistant'}
+                if content:
+                    assistant_msg['content'] = content
+                if tool_calls:
+                    assistant_msg['tool_calls'] = tool_calls
+                if response.get('_usage'):
+                    assistant_msg['_usage'] = response['_usage']
+                round_messages.append(assistant_msg)
+
+                # Dispatch tool calls
+                if tool_calls:
+                    for tc in tool_calls:
+                        tc_id = tc.get('id', '')
+                        fn = tc.get('function', {})
+                        fn_name = fn.get('name', '')
+                        fn_args_str = fn.get('arguments', '{}')
+
+                        try:
+                            fn_args = json.loads(fn_args_str)
+                        except json.JSONDecodeError:
+                            fn_args = {}
+
+                        # Log every dispatch, mirroring the main loop's
+                        # `[decision]   tool_call:` line.
+                        #
+                        # Without this a subagent's tool use is invisible: the only
+                        # trace a dispatch left was mcp_client's `[acp] registered
+                        # pending`, which non-ACP tools never emit at all. So a
+                        # subagent that called nothing looked exactly like one that
+                        # worked, and diagnosing the four silent peer delegations on
+                        # Orin6 meant inferring absence from an unrelated log line.
+                        print(f'[subagent:{self.id}]   tool_call: {fn_name}({fn_args_str[:300]})')
+
+                        # Dispatch
+                        result_text = await self._dispatch_tool(fn_name, fn_args)
+
+                        # Check for terminal tools
+                        if fn_name == 'subagent_finish':
+                            finish_output = fn_args.get('output', result_text)
+                        elif fn_name == 'subagent_fail':
+                            fail_reason = fn_args.get('reason', result_text)
+
+                        # Record tool result
+                        round_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'content': result_text,
+                        })
+
+                        # Track
+                        self._tool_calls_made.append({
+                            'name': fn_name,
+                            'round': round_idx,
+                        })
+
+                # Add round to context
+                self._context.add_turn(round_messages)
+                self.persist_turn(round_messages)
+                self.rounds_completed = round_idx + 1
+                self.updated_at = time.time()
+
+                # Check terminal conditions
+                if finish_output is not None:
+                    self.result = SubagentResult(
+                        agent_id=self.id,
+                        status=STATUS_COMPLETED,
+                        output=finish_output,
+                        tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
+                        rounds_used=self.rounds_completed,
+                        duration_s=time.time() - t0,
+                    )
+                    self.status = STATUS_COMPLETED
+                    if (not self.result.substantive_tool_calls()
+                            and getattr(self.spec, 'deliverable', 'action') != 'report'):
+                        # Reported success having only called bookkeeping tools.
+                        # Loud on purpose: this is indistinguishable from real work
+                        # in the output text, and a delegator that trusts the text
+                        # will believe the task was carried out.
+                        #
+                        # Skipped for `deliverable='report'` runs, where the
+                        # judgement *is* the deliverable — the background monitor
+                        # answers with `subagent_report` and nothing else, so for
+                        # it "only bookkeeping tools" is success, not a red flag.
+                        # It fired 85 times in one Tianyi log, every one a monitor
+                        # working exactly as designed, which is how a warning stops
+                        # being read at all.
+                        print(f'[subagent:{self.id}] WARNING: completed with zero '
+                              f'substantive tool calls — reported success without '
+                              f'acting. goal={self.spec.goal[:80]!r}')
+                    return self.result
+
+                if fail_reason is not None:
+                    self.result = SubagentResult(
+                        agent_id=self.id,
+                        status=STATUS_FAILED,
+                        output='',
+                        tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
+                        rounds_used=self.rounds_completed,
+                        duration_s=time.time() - t0,
+                        error=fail_reason,
+                    )
+                    self.status = STATUS_FAILED
+                    return self.result
+
+                # No tool calls and no finish = natural stop
+                if not tool_calls:
+                    self.result = SubagentResult(
+                        agent_id=self.id,
+                        status=STATUS_COMPLETED,
+                        output=content or '(no output)',
+                        tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
+                        rounds_used=self.rounds_completed,
+                        duration_s=time.time() - t0,
+                    )
+                    self.status = STATUS_COMPLETED
+                    return self.result
+
+                # Compression check
+                if self._context.needs_compression():
+                    await self._context.compress(llm_client, self.spec.model)
+
+                # Checkpoint check (done by manager externally)
+
+            # Max rounds reached — write up what we have before returning.
+            wrap_up = await self._wrap_up(content)
+            self.result = SubagentResult(
+                agent_id=self.id,
+                status=STATUS_PARTIAL,
+                output=wrap_up,
+                tool_calls_made=self._tool_calls_made,
+                actions=self._action_report(),
+                rounds_used=self.rounds_completed,
+                duration_s=time.time() - t0,
+                error=f'Reached max_rounds={self.spec.max_rounds}',
+            )
+            self.status = STATUS_PARTIAL
+            return self.result
+
+        except asyncio.CancelledError:
+            self.result = SubagentResult(
+                agent_id=self.id,
+                status=STATUS_CANCELLED,
+                output='',
+                tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
+                rounds_used=self.rounds_completed,
+                duration_s=time.time() - t0,
+            )
+            self.status = STATUS_CANCELLED
+            return self.result
+
+        except Exception as e:
+            # A cancellation that lands *inside* an await surfaces here as an
+            # exception rather than at the cooperative checkpoint at the top of the
+            # loop, so reporting every exception as FAILED loses the distinction and
+            # the reason with it. Measured on Tianyi: `spawn_sync timeout` cancelled
+            # three subagents mid-LLM-call and each was reported
+            # `✗ failed: TurnCancelled: Interrupted by user message during LLM call`
+            # — which names neither the real cause nor the fact that it was a
+            # deliberate cancel, and reads to the operator like a model error.
+            _cancelled = self._cancel_event.is_set()
+            _status = STATUS_CANCELLED if _cancelled else STATUS_FAILED
+            _error = (self._cancel_reason or 'cancelled') if _cancelled \
+                else f'{type(e).__name__}: {e}'
+            self.result = SubagentResult(
+                agent_id=self.id,
+                status=_status,
+                output='',
+                tool_calls_made=self._tool_calls_made,
+                actions=self._action_report(),
+                rounds_used=self.rounds_completed,
+                duration_s=time.time() - t0,
+                error=_error,
+            )
+            self.status = _status
+            print(f'[subagent:{self.id}] {_status} after '
+                  f'{self.rounds_completed} round(s): {_error}')
+            return self.result
+
+        finally:
+            if _hop_token is not None:
+                from peer.delegation import current_hop_count
+                current_hop_count.reset(_hop_token)
+            if _cancel_token is not None:
+                from peer.delegation import current_cancel_event
+                current_cancel_event.reset(_cancel_token)
+            mcp_client.current_agent_context.reset(_ctx_token)
+            # Commit perf spans for this subagent run
+            if _spans:
+                _spans.append({'span': 'subagent_total', 'component': 'subagent',
+                               'start_ts': t0, 'end_ts': time.time()})
+                try:
+                    import perf_log
+                    perf_log.commit_spans(
+                        trace_id=_trace_id,
+                        spans=_spans,
+                        source=f'subagent:{self.id}',
+                        trigger_text=self.spec.goal[:200],
+                    )
+                except Exception:
+                    pass
+
+    def _note_action_id(self, result) -> None:
+        """Record any ACP action_id this tool call started.
+
+        The id is in the tool's own reply, which `call_tool` returns as text (or as
+        a dict for a few tools), so parse rather than reach into mcp_client's
+        pending tables — those are process-global and shared with every other agent,
+        and picking "the newest pending" out of them would attribute another
+        subagent's action to this one under concurrency.
+        """
+        payload = result
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                return
+        if not isinstance(payload, dict):
+            return
+        action_id = payload.get('action_id')
+        if isinstance(action_id, str) and action_id and action_id not in self._action_ids:
+            self._action_ids.append(action_id)
+
+    async def _settle_own_actions(self) -> None:
+        """Wait for the actions this run started before declaring the run finished.
+
+        The main loop barriers `finish` for the same reason (_ACP_BARRIER_SYSTEM_TOOLS):
+        ending a turn while audio is still playing truncates it. `subagent_finish` is
+        the subagent's equivalent and was not barriered, which broke two things.
+
+        Measured on Orin6: a delegated subagent called tts, then `subagent_finish`
+        1.2s *before* the audio finished — so the delegation returned early and the
+        delegator could start its own line over the top, which is the whole bug this
+        change exists to remove.
+
+        Worse, it made the new action manifest lie. `/api/acp/complete` only sets the
+        pending's event; the terminal state is recorded when a barrier or `sync`
+        forgets it. Finishing first meant `action_outcome()` still returned None, so
+        `_action_report()` reported 'pending' and `peer_delegate` announced "did NOT
+        confirm" for a line that had in fact played. A verifier that cries wolf is
+        worse than none.
+
+        Waits only on ids this run started, so a concurrent subagent's audio on a
+        different channel is not waited for. Cancellation still cuts it short.
+        """
+        if not self._action_ids:
+            return
+        outstanding = [aid for aid in self._action_ids
+                       if aid in mcp_client._pending_actions]
+        if not outstanding:
+            return
+        result = await mcp_client.sync(outstanding, timeout=180,
+                                       cancel_event=self._cancel_event)
+        status = (result or {}).get('status')
+        if status != 'completed':
+            print(f'[subagent:{self.id}] actions did not all settle before finish: '
+                  f'{status} ({outstanding})')
+
+    def _action_report(self) -> list[dict]:
+        """Each action this run started, with the terminal state it reached.
+
+        `pending` means it never resolved before the run ended — which for a
+        delegated task means the caller must not treat it as done.
+        """
+        out = []
+        for aid in self._action_ids:
+            outcome = mcp_client.action_outcome(aid)
+            out.append({
+                'action_id': aid,
+                'status': (outcome or {}).get('status', 'pending'),
+                'tool': (outcome or {}).get('tool', ''),
+            })
+        return out
+
+    async def _wrap_up(self, last_content: str) -> str:
+        """One final toolless LLM call: turn the run's findings into an answer.
+
+        A subagent that runs out of rounds is almost always mid-tool-call, so
+        `last_content` is empty and the caller used to receive the literal string
+        '(max rounds reached)'. Measured on Orin5: a research run made 22 WebSearch
+        calls and one WebFetch over its 10 rounds, then handed the main agent that
+        placeholder — every finding discarded at the finish line.
+
+        Tools are withheld on purpose. The budget is spent; offering tools here
+        just invites another search whose result nothing would read.
+
+        Falls back to `last_content`, then to the placeholder, so this can only
+        add information — a failing LLM call leaves the old behaviour intact.
+        """
+        placeholder = last_content or '(max rounds reached)'
+        if not self._tool_calls_made:
+            # Nothing was gathered; there is nothing to write up.
+            return placeholder
+
+        try:
+            messages = self._context.build_messages()
+            messages.append({
+                'role': 'user',
+                'content': (
+                    f'[系统] 你已用完 {self.spec.max_rounds} 轮预算，不能再调用任何工具。\n'
+                    '现在直接输出最终结果：把已经查到的信息整理成对任务目标的回答，'
+                    '保留具体数字、来源和结论。如果有没查到的部分，在末尾用一两句说明缺口，'
+                    '不要因此放弃已有内容。'
+                ),
+            })
+            import client as _client
+            response = await _client.call(
+                message_list=messages,
+                tool_list=[],
+                cancel_event=self._cancel_event,
+                model_override=self.spec.model,
+                trace_id=f'subagent:{self.id}:wrap_up',
+                caller_info={'agent_type': 'subagent'},
+            )
+            text = (response.get('content') or '').strip()
+            if text:
+                print(f'[subagent:{self.id}] wrap-up produced {len(text)} chars '
+                      f'after {self.rounds_completed} round(s)')
+                return text
+            print(f'[subagent:{self.id}] wrap-up returned empty content')
+        except Exception as e:
+            print(f'[subagent:{self.id}] wrap-up failed: {e}')
+
+        return placeholder
+
+    async def _dispatch_tool(self, name: str, args: dict) -> str:
+        """Dispatch a tool call and return result text."""
+        # Subagent system tools
+        if name == 'subagent_finish':
+            await self._settle_own_actions()
+            return args.get('output', 'done')
+        if name == 'subagent_fail':
+            return args.get('reason', 'failed')
+        if name == 'subagent_report':
+            progress = args.get('progress', '')
+            urgent = args.get('urgent', False)
+            if not progress.strip():
+                return 'ok'
+            self._progress_reports.append(progress)
+            print(f'[subagent:{self.id}] progress{"(urgent)" if urgent else ""}: {progress[:100]}')
+            if urgent:
+                # 紧急：直接进 event_bus → 触发 main agent
+                import event_bus
+                await event_bus.enqueue(
+                    source=f'subagent:{self.id}/report',
+                    text=progress,
+                )
+            else:
+                # 非紧急：存入 DB 供 memory_recall 检索，不触发 main agent
+                try:
+                    import time as _time
+                    from config import _get_conn
+                    with _get_conn() as conn:
+                        conn.execute(
+                            'INSERT INTO subagent_conclusions (agent_id, goal, conclusion, source_type, created_at) '
+                            'VALUES (?, ?, ?, ?, ?)',
+                            (self.id, self.spec.goal[:100], progress, 'bg_monitor', _time.time())
+                        )
+                        conn.commit()
+                except Exception as e:
+                    print(f'[subagent:{self.id}] save report to DB failed: {e}')
+            return 'ok'
+
+        # MCP tool call
+        if name.startswith('mcp__'):
+            try:
+                # ACP barrier, same judgement the main loop uses. Without it a
+                # subagent's `speak` returned at *enqueue* time, so the subagent
+                # reported "completed / 已排队播放" and `peer_delegate` returned
+                # before a single word had been played — which is why turn-taking
+                # between two robots never lined up.
+                #
+                # Scoped by physical resource, not global. This is load-bearing: a
+                # global barrier here would make one subagent's speech block every
+                # other subagent's every actuator call, on unrelated hardware,
+                # collapsing N concurrent agents into an effective 1. Concurrency
+                # only looked fine before because this path had no barrier at all.
+                #
+                # `self._cancel_event` so a cancelled subagent stops waiting rather
+                # than holding its slot for the full playback.
+                from event.llm import _acp_barrier, _needs_barrier
+                _parallel = mcp_client.take_parallel_flag(args)
+                _bar_needed, _bar_want = _needs_barrier(name, args)
+                if _bar_needed:
+                    await _acp_barrier(f'subagent:{self.id}/{name}',
+                                       self._cancel_event,
+                                       want=_bar_want, scoped=True,
+                                       concurrent=_parallel)
+                result = await mcp_client.call_tool(name, args)
+                self._note_action_id(result)
+                if isinstance(result, dict):
+                    return json.dumps(result, ensure_ascii=False)
+                return str(result)
+            except Exception as e:
+                return f'[tool error] {type(e).__name__}: {e}'
+
+        # Desktop tool call (system tools from main agent)
+        from event.llm import _event_instance
+        if _event_instance and name in _event_instance._sys_tools:
+            try:
+                # Hand-off tools need the ACP barrier here too. Phase 1 added it only
+                # to the `mcp__` branch above, so a subagent calling `peer_call` never
+                # waited for its own audio — the barrier the main loop applies to that
+                # exact tool was bypassed entirely by going one level down.
+                #
+                # Measured on Orin6, its delegated subagent alternating both mouths:
+                #   16:32:24.343  own pending speak-de3a6c33 (plays to 16:32:40)
+                #   16:32:27.296  peer_call(make Orin5 speak)   <- 2.9s in, no wait
+                # Same shape as the main-loop bug, one layer lower.
+                from event.llm import _acp_barrier, _sys_tool_needs_barrier
+                if _sys_tool_needs_barrier(name):
+                    await _acp_barrier(f'subagent:{self.id}/{name}',
+                                       self._cancel_event, scoped=False)
+                fn = _event_instance._sys_tools[name]['object']
+                result = await fn(**args)
+                if isinstance(result, list):
+                    # 多模态结果（如 Read 读图片）——子代理的消息装配是纯文本的，
+                    # 直接 str() 会把整段 base64 塞进上下文，只保留文字部分
+                    texts = [p.get('text', '') for p in result
+                             if isinstance(p, dict) and p.get('type') == 'text']
+                    return ('\n'.join(t for t in texts if t) +
+                            '\n(图片内容无法在子代理中查看，请把该路径交给主代理处理)')
+                result_str = str(result) if result else '(no output)'
+                # 截断大结果（WebSearch/WebFetch 等可能返回 6K+ chars）
+                _MAX_TOOL_RESULT = 2500
+                if len(result_str) > _MAX_TOOL_RESULT:
+                    result_str = result_str[:_MAX_TOOL_RESULT] + '\n...(结果已截断，如需更多请细化查询)'
+                return result_str
+            except Exception as e:
+                return f'[tool error] {type(e).__name__}: {e}'
+
+        return f'[unknown tool] {name}'
+
+    # ── Checkpoint/Restore ─────────────────────────────────────────────────────
+
+    def to_checkpoint(self) -> dict:
+        """Serialize full state for persistence."""
+        return {
+            'id': self.id,
+            'spec': self.spec.to_dict(),
+            'status': self.status,
+            'rounds_completed': self.rounds_completed,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at,
+            'context': self._context.to_checkpoint(),
+            'tool_calls_made': self._tool_calls_made,
+            'progress_reports': self._progress_reports,
+        }
+
+    @classmethod
+    def from_checkpoint(cls, data: dict) -> Subagent:
+        """Restore a subagent from persisted checkpoint data."""
+        spec = SubagentSpec.from_dict(data['spec'])
+        agent = cls(spec=spec, agent_id=data['id'])
+        agent.status = data['status']
+        agent.rounds_completed = data['rounds_completed']
+        agent.created_at = data['created_at']
+        agent.updated_at = data['updated_at']
+        agent._tool_calls_made = data.get('tool_calls_made', [])
+        agent._progress_reports = data.get('progress_reports', [])
+
+        # Restore context
+        ctx = data.get('context', {})
+        agent._context.restore_from_checkpoint(
+            turns=ctx.get('turns', []),
+            summary=ctx.get('summary', ''),
+        )
+        return agent
