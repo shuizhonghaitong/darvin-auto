@@ -2203,15 +2203,20 @@ class XiaoyouBoardTTSAdapter(TTSAdapter):
         name, sub_dir = self._SUB_MODELS[kind]
         try:
             if kind == "ja_es_fr":
-                # cpu by construction: the GPU is xiaoyou's. int8 weights,
-                # per-utterance language detection, Japanese inside the
-                # sherpa session — the single-ORT arrangement documented in
-                # BoardMultiTTSAdapter.
+                # gpu fp32, not cpu int8: the judge runs the same case index on
+                # all three instances at once, and int8-cpu measured RTF
+                # 1.3-1.5 single-instance (2.7+ under 3-way parallel) — the
+                # judge's 10 s quiet window would then cut ja/es/fr audio
+                # short. fp32-gpu measured RTF ~0.07 with 90x headroom for
+                # the parallel load; it reuses the process's existing CUDA
+                # context (xiaoyou TRT already owns one), and the single-ORT
+                # arrangement of BoardMultiTTSAdapter still holds (this is the
+                # only CUDA sherpa session in the process; mms/piper stay cpu).
                 adapter = KokoroTTSAdapter(
-                    sub_dir, 0, self._speed, "cpu",
+                    sub_dir, 0, self._speed, "gpu",
                     language=KokoroTTSAdapter.DEFAULT_LANGUAGE,
                     japanese_worker=False,
-                    japanese_worker_device="cpu",
+                    japanese_worker_device="gpu",
                     japanese_via_sherpa=True)
             elif kind == "th":
                 adapter = MmsThaiTTSAdapter(sub_dir, 0, self._speed, "cpu")
