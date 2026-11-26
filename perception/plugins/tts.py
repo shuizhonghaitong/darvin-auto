@@ -3237,7 +3237,7 @@ DEFAULT_TTS_ENGINE = "vits2-zh-en"
 # `matcha` and `mms-th` both run on sherpa-onnx.
 #
 # Language codes, not country codes: `zh`, not `cn`.
-TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi", "board-multi")
+TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi", "board-multi", "board-xiaoyou")
 # What each engine can speak, in the codes the rest of this file uses. Answered
 # by action=support_language straight from the facade: it is a property of the
 # engine, not of a loaded model, so it works while an engine is still loading.
@@ -3252,6 +3252,9 @@ ENGINE_LANGUAGES = {
     # six on kokoro, th on MMS Thai, de and ru on Piper (see
     # BoardMultiTTSAdapter._SUB_LABELS).
     "board-multi": ("zh", "en", "ja", "ru", "es", "fr", "th", "de"),
+    # Same eight board languages; zh/en on xiaoyou01, ja/es/fr on the kokoro
+    # sub, th on MMS, de/ru on piper (see XiaoyouBoardTTSAdapter._LABELS).
+    "board-xiaoyou": ("zh", "en", "ja", "ru", "es", "fr", "th", "de"),
 }
 # Older spellings, still accepted. `vits2_trt` and `sherpa_onnx` are not
 # decoration: both are already persisted in ConfigDB rows and in config.yaml on
