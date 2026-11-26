@@ -1,0 +1,41 @@
+# Darwin subnet 314 (具身智能-感知能力-动作识别榜, action recognition), Jetson JP6 (JP_VERSION=6)
+# Thin overlay on the official arm64 perception runtime, following the
+# officially documented base tag pattern (deploy/build_perception.sh:
+# perception:release.<date>.<commit>-jetson-jp6.1).
+# The platform wrapper launches ./start.sh from the repository root (WORKDIR below).
+#
+# Risk R1 (recorded in the delivery report): this release tag could not be
+# pulled anonymously from the research container (registry 401), so the tag
+# itself is unverified. The authorised git-commit delivery does not depend on
+# this image — it runs start.sh inside the official shell image
+# (harbor-contest.4pd.io/wanglimin/sut/robot_pose:0.0.1) with the repo cloned
+# from PHANTHYMOTUS_REPO @ PHANTHYMOTUS_COMMIT_ID; this file is the JP6
+# self-build path for the same code.
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.261030.129c70c-jetson-jp6.1
+
+WORKDIR /work
+
+# Upstream perception bundle (reference plugin perception/plugins/pose.py for
+# this leaderboard), verbatim except:
+#  - perception/main.py: competition-mandated MCP_PORT/WS_PORT env-port
+#    override and the GET /ready readiness endpoint;
+#  - perception/plugins/pose_stgcn.py: kinematic corroboration veto +
+#    gait-conflict rule on the hybrid action decision (decision-level only,
+#    no model or preprocessing change; rollback switches action_kinematic_veto
+#    / action_gait_conflict_rule in the pose config);
+#  - perception/config.yaml: pose-only profile — every other plugin disabled,
+#    bounding per-instance memory inside the 1 CPU / 4 Gi SUT envelope.
+COPY perception/ /work/perception/
+COPY start.sh /work/start.sh
+RUN chmod +x /work/start.sh
+
+# JP_VERSION 6 (JetPack 6.x, jammy base, python 3.10): no PyYAML
+# --ignore-installed step — that workaround is jp5.11 (focal) specific and is
+# a no-op on jp6.1 per the official perception/Dockerfile.jetson.
+ENV MCP_PORT=80 \
+    WS_PORT=15721 \
+    JP_VERSION=6
+
+EXPOSE 80
+
+CMD ["/work/start.sh"]
