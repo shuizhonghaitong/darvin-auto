@@ -4,6 +4,7 @@ Original observations remain untouched. Ambiguous associations stay separate."""
 from __future__ import annotations
 from statistics import median
 import math
+import os
 import re
 import unicodedata
 _NUMBER_TEXT = re.compile('[¥$€£]?[+-]?[0-9OoIlLSsBZbz][0-9OoIlLSsBZbz,.]*(?:[x×]\\d+)?(?:万|千|亿)?(?:%|\\+|元|人|家|项|次|台|个|年|月|天|米|秒|kg|km|cm|mm|m|g)?[↑↓]?')
@@ -1077,6 +1078,11 @@ def organize(items, image_size=None):
             if bound:
                 bound['text'] = '上方文字：' + _plain_quotes(heading) + '。\n' + bound['text']
                 return bound
+    if _V2_ENABLED:
+        for detector in (_v2_paired_rows, _v2_metric_row, _v2_columns):
+            bound = detector(readable)
+            if bound:
+                return bound
     tree = _partition(readable)
     if _hierarchy_eligible(tree):
         return {'mode': 'hierarchy', 'text': _hierarchical_summary(readable, image_size).split('\n识别备注：', 1)[0]}
@@ -1111,6 +1117,274 @@ def organize(items, image_size=None):
         return {'mode': 'regions', 'text': '上方独立文字：' + _plain_quotes(headers) + '。\n下方内容：\n' + '\n'.join(_region_lines(readable))}
     return {'mode': 'regions', 'text': '\n'.join(_region_lines(readable))}
 
+
+# ── v2 additions: paired rows, metric rows, general column layouts ─────────────
+# OCR_SUMMARY_V2=0 disables all v2 detectors and falls back to the
+# baseline rule path (the code below the gate is unchanged).
+_V2_ENABLED = os.environ.get("OCR_SUMMARY_V2", "1") != "0"
+
+
+# All detectors are strictly geometric; they only describe observed items and
+# fall back to the baseline behaviour when structure is not confident.
+
+def _v2_bands(items, max_gap_factor=1.4):
+    """Group items into horizontal bands by vertical center proximity."""
+    ordered = sorted(items, key=lambda i: ((i['bbox'][1] + i['bbox'][3]) / 2))
+    if not ordered:
+        return []
+    heights = [max(1, i['bbox'][3] - i['bbox'][1]) for i in ordered]
+    limit = max_gap_factor * median(heights)
+    bands = [[ordered[0]]]
+    for item in ordered[1:]:
+        prev = bands[-1][-1]
+        cy = (item['bbox'][1] + item['bbox'][3]) / 2
+        py = (prev['bbox'][1] + prev['bbox'][3]) / 2
+        if cy - py <= limit:
+            bands[-1].append(item)
+        else:
+            bands.append([item])
+    return bands
+
+
+def _v2_fullwidth_bands(readable, bounds):
+    """Lone-in-row items that act as header/footer bands.
+
+    An item is a band member when nothing else shares its row (within
+    0.8*height) and it is either wide (>=45% of content width) or centered
+    near the content center. Returns (top_band, bottom_band, middle, rest).
+    """
+    scale = _scale(readable)
+    total_w = max(1, bounds[2] - bounds[0])
+    cx_all = (bounds[0] + bounds[2]) / 2
+    lone, shared = [], []
+    for item in readable:
+        h = max(1, item['bbox'][3] - item['bbox'][1])
+        cy = (item['bbox'][1] + item['bbox'][3]) / 2
+        partner = any(
+            other is not item and abs(((other['bbox'][1] + other['bbox'][3]) / 2) - cy) <= 0.8 * h
+            and abs(((other['bbox'][0] + other['bbox'][2]) / 2) - (item['bbox'][0] + item['bbox'][2]) / 2) > 0.3 * h
+            for other in readable)
+        (shared if partner else lone).append(item)
+    bands = []
+    for item in lone:
+        w = item['bbox'][2] - item['bbox'][0]
+        centered = abs((item['bbox'][0] + item['bbox'][2]) / 2 - cx_all) <= 0.18 * total_w
+        if w >= 0.45 * total_w or centered:
+            bands.append(item)
+    rest = [i for i in readable if i not in bands]
+    if not bands or not rest:
+        return [], [], None, readable
+    rest_top = min(i['bbox'][1] for i in rest)
+    rest_bottom = max(i['bbox'][3] for i in rest)
+    top_band = [b for b in bands if b['bbox'][3] <= rest_top + 0.6 * scale]
+    bottom_band = [b for b in bands if b['bbox'][1] >= rest_bottom - 0.6 * scale]
+    middle = [b for b in bands if b not in top_band and b not in bottom_band]
+    if middle:
+        return [], [], middle, readable
+    return top_band, bottom_band, [], rest
+
+
+def _v2_paired_rows(readable):
+    """Label-left / value-right stacked rows (spec sheets, parameter lists)."""
+    if len(readable) < 6:
+        return None
+    bands = _v2_bands(readable)
+    rows = [b for b in bands if len(b) >= 2]
+    singletons = [b[0] for b in bands if len(b) == 1]
+    if len(rows) < 3:
+        return None
+    scale = _scale(readable)
+    bounds = _bounds(readable)
+    total_w = max(1, bounds[2] - bounds[0])
+    for band in rows:
+        band.sort(key=lambda i: (i['bbox'][0] + i['bbox'][2]) / 2)
+        for left, right in zip(band, band[1:]):
+            if right['bbox'][0] - left['bbox'][2] < 0.3 * scale:
+                return None
+        if band[-1]['bbox'][2] - band[0]['bbox'][0] < 0.5 * total_w:
+            return None
+    lefts = [band[0] for band in rows]
+    left_starts = [i['bbox'][0] for i in lefts]
+    if max(left_starts) - min(left_starts) > 2.5 * scale:
+        return None
+    right_ends = [band[-1]['bbox'][2] for band in rows]
+    aligned_values = max(right_ends) - min(right_ends) <= 3.0 * scale
+    # rows must be stacked: no two rows share vertical center
+    row_ys = [median(((i['bbox'][1] + i['bbox'][3]) / 2 for i in band)) for band in rows]
+    if any(abs(a - b) < 0.6 * scale for a in row_ys for b in row_ys if a is not b):
+        return None
+    heading = [s for s in singletons if (s['bbox'][1] + s['bbox'][3]) / 2 < row_ys[0] - 0.3 * scale]
+    footer = [s for s in singletons if (s['bbox'][1] + s['bbox'][3]) / 2 > row_ys[-1] + 0.3 * scale]
+    lines = []
+    if heading:
+        lines.append('顶部文字为' + _plain_quotes(sorted(heading, key=_reading_order)) + '。')
+    n = len(rows)
+    if aligned_values:
+        lines.append('下方为' + str(n) + '行左右对应的条目，每行左侧为名称、右侧为取值，从上到下依次为：')
+    else:
+        lines.append('下方为' + str(n) + '行条目，每行从左到右排列，从上到下依次为：')
+    for k, band in enumerate(rows):
+        band = sorted(band, key=lambda i: (i['bbox'][0] + i['bbox'][2]) / 2)
+        lines.append('（' + str(k + 1) + '）' + _plain_quotes(band[:1]) + '对应' + _plain_quotes(band[1:]) + '。')
+    if footer:
+        lines.append('底部文字为' + _plain_quotes(sorted(footer, key=_reading_order)) + '。')
+    return {'mode': 'paired-rows', 'text': '\n'.join(lines)}
+
+
+def _v2_metric_row(readable):
+    """A horizontal row of prominent values, each with a nearby caption."""
+    if len(readable) < 4:
+        return None
+    scale = _scale(readable)
+    sizes = [_font_size(i) for i in readable]
+    typical = median(sizes)
+    big = [i for i in readable if _font_size(i) >= 1.3 * typical]
+    if len(big) < 2:
+        return None
+    # keep only the biggest horizontal cluster (title-sized items may join)
+    big.sort(key=lambda i: (i['bbox'][1] + i['bbox'][3]) / 2)
+    clusters = [[big[0]]]
+    for item in big[1:]:
+        prev = clusters[-1][-1]
+        ph = max(1, prev['bbox'][3] - prev['bbox'][1])
+        ih = max(1, item['bbox'][3] - item['bbox'][1])
+        if ((item['bbox'][1] + item['bbox'][3]) / 2 - (prev['bbox'][1] + prev['bbox'][3]) / 2) <= 0.9 * max(ph, ih):
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+    cluster = max(clusters, key=len)
+    if len(cluster) < 2 or len(cluster) > 6:
+        return None
+    # rescue same-row cards the size threshold missed (e.g. shorter glyphs)
+    if len(cluster) < 6:
+        band_lo = min(i['bbox'][1] for i in cluster)
+        band_hi = max(i['bbox'][3] for i in cluster)
+        med_size = median(_font_size(i) for i in cluster)
+        known = set(id(c) for c in cluster)
+        cands = [o for o in readable if id(o) not in known
+                 and _font_size(o) >= 0.75 * med_size
+                 and o['bbox'][3] > band_lo and o['bbox'][1] < band_hi]
+        for o in sorted(cands, key=lambda i: i['bbox'][0]):
+            if len(cluster) >= 6:
+                break
+            h = max(1, o['bbox'][3] - o['bbox'][1])
+            if all((o['bbox'][0] - c['bbox'][2] >= 0.3 * h) or (c['bbox'][0] - o['bbox'][2] >= 0.3 * h)
+                   for c in cluster):
+                cluster.append(o)
+    cluster.sort(key=lambda i: i['bbox'][0])
+    cy = median(((i['bbox'][1] + i['bbox'][3]) / 2 for i in cluster))
+    big_h = median(max(1, i['bbox'][3] - i['bbox'][1]) for i in cluster)
+    if any(abs(((i['bbox'][1] + i['bbox'][3]) / 2) - cy) > 0.8 * big_h for i in cluster):
+        return None
+    bounds = _bounds(readable)
+    if cluster[-1]['bbox'][2] - cluster[0]['bbox'][0] < 0.5 * max(1, bounds[2] - bounds[0]):
+        return None
+    for left, right in zip(cluster, cluster[1:]):
+        if right['bbox'][0] - left['bbox'][2] < 0.3 * big_h:
+            return None
+    captions = []
+    used = set(id(i) for i in cluster)
+    for i in cluster:
+        cx = (i['bbox'][0] + i['bbox'][2]) / 2
+        reach = max(1.2 * big_h, (i['bbox'][2] - i['bbox'][0]) * 0.7)
+        below = [o for o in readable if id(o) not in used and o['bbox'][1] >= i['bbox'][3] - 0.2 * big_h
+                 and abs((o['bbox'][0] + o['bbox'][2]) / 2 - cx) <= reach
+                 and o['bbox'][1] - i['bbox'][3] <= 2.5 * big_h]
+        above = [o for o in readable if id(o) not in used and o['bbox'][3] <= i['bbox'][1] + 0.2 * big_h
+                 and abs((o['bbox'][0] + o['bbox'][2]) / 2 - cx) <= reach
+                 and i['bbox'][1] - o['bbox'][3] <= 2.5 * big_h]
+        cap = below if below else above
+        if not cap:
+            return None
+        cap.sort(key=lambda o: o['bbox'][0])
+        captions.append((i, cap[0], bool(below)))
+        used.add(id(cap[0]))
+    others = [o for o in readable if id(o) not in used]
+    top = sorted([o for o in others if o['bbox'][3] <= cluster[0]['bbox'][1] + 0.3 * big_h], key=_reading_order)
+    bottom = sorted([o for o in others if o['bbox'][1] >= max(i['bbox'][3] for i, _c, _d in captions) - 0.3 * big_h], key=_reading_order)
+    lines = []
+    if top:
+        lines.append('顶部文字为' + _plain_quotes(top) + '。')
+    rel = '下方标注' if any(d for _i, _c, d in captions) else '上方标注'
+    entries = ['（' + str(k + 1) + '）' + _plain_quotes([i]) + '（' + rel + '为' + _plain_quotes([c]) + '）'
+               for k, (i, c, _d) in enumerate(captions)]
+    lines.append(str(len(cluster)) + '项突出数值横向并列，从左到右为：' + '；'.join(entries) + '。')
+    if bottom:
+        lines.append('底部文字为' + _plain_quotes(bottom) + '。')
+    return {'mode': 'metric-row', 'text': '\n'.join(lines)}
+
+
+def _v2_columns(readable):
+    """General K-column layout with optional full-width top/bottom bands."""
+    if len(readable) < 4:
+        return None
+    bounds = _bounds(readable)
+    scale = _scale(readable)
+    total_w = max(1, bounds[2] - bounds[0])
+    top_band, bottom_band, middle, rest = _v2_fullwidth_bands(readable, bounds)
+    if middle or len(rest) < 4:
+        return None
+    centers = [((i['bbox'][0] + i['bbox'][2]) / 2, i) for i in rest]
+    centers.sort(key=lambda t: (t[0], t[1]['bbox'][1], t[1]['bbox'][0], t[1]['text']))
+    for k in (2, 3):
+        if len(rest) < 2 * k:
+            continue
+        gaps = []
+        for idx in range(1, len(centers)):
+            gap = centers[idx][0] - centers[idx - 1][0]
+            if gap >= 0.5 * scale:
+                gaps.append((gap, (centers[idx - 1][0] + centers[idx][0]) / 2))
+        if not gaps:
+            continue
+        cuts = sorted(c for _g, c in sorted(gaps, key=lambda s: -s[0])[:k - 1])
+        buckets = [[] for _ in range(k)]
+        for c, i in centers:
+            pos = 0
+            for cut in cuts:
+                if c >= cut:
+                    pos += 1
+            buckets[pos].append(i)
+        groups = [b for b in buckets if b]
+        if len(groups) != k or any(len(g) < 2 for g in groups):
+            continue
+        spans = [_bounds(g)[1:3] for g in groups]
+        overlap_ok = True
+        for a in range(k):
+            for b in range(a + 1, k):
+                ov = min(spans[a][1], spans[b][1]) - max(spans[a][0], spans[b][0])
+                if ov < 0.25 * min(spans[a][1] - spans[a][0], spans[b][1] - spans[b][0]):
+                    overlap_ok = False
+        if not overlap_ok:
+            continue
+        ordered_centers = [sorted((i['bbox'][0] + i['bbox'][2]) / 2 for i in g) for g in groups]
+        if any(ordered_centers[a][-1] >= ordered_centers[a + 1][0] for a in range(k - 1)):
+            continue
+        def describe_column(g, label):
+            g = sorted(g, key=_reading_order)
+            head = None
+            if len(g) >= 3:
+                gsizes = [_font_size(i) for i in g]
+                largest = max(gsizes)
+                typical = median(gsizes)
+                if largest >= 1.3 * typical:
+                    head = [i for i in g if _font_size(i) >= 0.8 * largest and i['bbox'][1] <= g[0]['bbox'][3] + 0.3 * largest]
+            text = '【' + label + '】'
+            if head:
+                body = [i for i in g if i not in head]
+                text += '标题为' + _plain_quotes(head) + '，下方从上到下为' + _plain_quotes(body) + '。'
+            else:
+                text += '从上到下为' + _plain_quotes(g) + '。'
+            return text
+        names = {2: ('左侧', '右侧'), 3: ('左侧', '中间', '右侧')}[k]
+        lines = []
+        if top_band:
+            lines.append('顶部文字为' + _plain_quotes(sorted(top_band, key=_reading_order)) + '。')
+        overview = '主体从左到右分为' + str(k) + ('个纵向区块' if k == 2 else '列') + '：'
+        lines.append(overview + '\n' + '\n'.join(describe_column(g, names[a]) for a, g in enumerate(groups)))
+        if bottom_band:
+            lines.append('底部文字为' + _plain_quotes(sorted(bottom_band, key=_reading_order)) + '。')
+        return {'mode': 'columns', 'text': '\n'.join(lines)}
+    return None
 
 def build_ocr_summary(items, image_size=None):
     """Describe existing text boxes without changing or completing observations.
