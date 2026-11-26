@@ -53,7 +53,7 @@ from std_msgs.msg import String
 
 from utils.ros_lifecycle import dispose_node
 
-from plugins.image_input import BadInput, load_image_bytes
+from plugins.image_input import BadInput, check_under_roots, load_image_bytes
 from plugins.pose_action import (
     ACTION_LABELS_ZH,
     DEFAULT_THRESHOLDS,
@@ -172,6 +172,18 @@ WITHDRAWN_BACKENDS = {"stgcn": "hybrid"}
 # looks like a wrong model.
 MIN_FPS_FOR_TEMPORAL_BACKEND = 12
 
+# Extensions that mark an input as a clip. A file with one of these sent to
+# recognize_by_photo is rerouted to the temporal path instead of failing
+# imdecode — the leaderboard input is mp4 and the caller may not know the split.
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".m4v", ".mkv", ".webm")
+# Wire cap for URL-fetched video. Local files are streamed from disk by
+# cv2.VideoCapture, never fully loaded, so only the download path is bounded.
+DEFAULT_MAX_VIDEO_BYTES = 512 * 1024 * 1024
+# Frames sampled per request, worst case. What stays resident is keypoint
+# history (a few seconds of 17x3 floats per track), so the bound is about
+# wall-clock per request, not memory.
+MAX_VIDEO_FRAMES = 900
+
 
 def output_topic_for(input_topic: Optional[str]) -> str:
     """The one place the lean output topic is derived from the input.
@@ -262,6 +274,7 @@ TOOLS = [
                     "enum": [
                         "start", "stop", "info", "config",
                         "recognize_by_photo", "recognize_by_url",
+                        "recognize_video",
                         "list_actions",
                     ],
                     "description": "Action to perform",
@@ -275,6 +288,7 @@ TOOLS = [
                 # open, so no shared mount is needed.
                 "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/scene.jpg）。常见格式都支持，过大的图会本地缩放"},
                 "url": {"type": "string", "description": "图片的 http(s) 地址。下载后本地解码，格式限制同 image_path"},
+                "video_path": {"type": "string", "format": "file", "accept": "video/*", "uploadTo": "mcp", "description": "视频文件（mp4 等）。从卡片上传，或填一个容器可读的路径（如 /models/uploads/clip.mp4）。一次性识别整段视频里的人在做什么，不需要摄像头"},
                 "confidence": {"type": "number", "description": "本次识别的人体检测置信度阈值（0-1）。不填则用卡片配置的值"},
             },
             "required": ["action"],
@@ -290,6 +304,10 @@ TOOLS = [
                 "recognize_by_url": {
                     "params": ["url", "confidence"],
                     "description": "同 recognize_by_photo，只是图片来自 http(s)",
+                },
+                "recognize_video": {
+                    "params": ["video_path", "url", "confidence"],
+                    "description": "看一段视频（mp4 等）里的人在做什么 —— 一次性识别，不需要摄像头也不需要先 start。按 fps 采样帧，用人体关键点 + 动作模型判定，返回每个人的 activity / activity_zh / activity_score",
                 },
                 "list_actions": {
                     "params": [],
@@ -1369,6 +1387,13 @@ class PosePerceptionPlugin:
     def _recognize_image(self, args: dict, url_action: str) -> dict:
         """Decode one image and read the people in it once."""
         cfg = dict(self._plugin_cfg)
+        # A clip sent where an image was expected is the classic leaderboard
+        # input. Reroute on the extension before any bytes move: cv2.imdecode
+        # happily reads an mp4's *first frame*, and one still image cannot
+        # support a temporal verdict, so the image path would answer with
+        # `temporal: false` for a video.
+        if self._looks_like_video(args):
+            return self._recognize_video(args)
         try:
             data, source = load_image_bytes(args, cfg, url_action=url_action)
         except BadInput as error:
@@ -1378,6 +1403,8 @@ class PosePerceptionPlugin:
 
         started = time.time()
         frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None and self._looks_like_video(args):
+            return self._recognize_video(args)
         if frame is None:
             return BadInput(
                 "could not decode that file as an image — check it is a real "
@@ -1514,6 +1541,280 @@ class PosePerceptionPlugin:
                      points, allowed=merged["gesture_whitelist"]).get("gesture")}
                 for points, score in loose_hands]} if loose_hands else {}),
         }
+
+    # ── one-shot video recognition ─────────────────────────────────────────
+
+    def _looks_like_video(self, args: dict) -> bool:
+        """True when the caller named a clip, by file or URL extension.
+
+        Judged before any bytes move: it is the difference between "this is a
+        clip, run it temporally" and "this image is corrupt", and only the
+        first deserves the reroute.
+        """
+        for key in ("video_path", "image_path", "path",
+                    "url", "video_url", "image_url"):
+            value = args.get(key)
+            if not value:
+                continue
+            name = str(value).split("?", 1)[0].split("#", 1)[0]
+            if name.lower().endswith(VIDEO_EXTENSIONS):
+                return True
+        return False
+
+    def _video_path(self, args: dict, cfg: dict) -> tuple:
+        """Resolve the clip to a file this container can open.
+
+        Returns (path, source, cleanup). A local path is streamed straight
+        from disk by cv2.VideoCapture — nothing loads the whole clip into
+        memory — so its only gate is the image roots. URL input downloads to
+        a temp file under the wire cap; the caller unlinks it.
+        """
+        url = args.get("url") or args.get("video_url") or args.get("image_url")
+        if url:
+            import tempfile
+            import urllib.request
+
+            resolved_url = str(url)
+            handle = tempfile.NamedTemporaryFile(
+                prefix="pose_video_", suffix=".mp4", delete=False)
+            handle.close()
+            try:
+                request = urllib.request.Request(
+                    resolved_url, headers={"User-Agent": "phanty-perception/1.0"})
+                with urllib.request.urlopen(request, timeout=60) as response, \
+                        open(handle.name, "wb") as out:
+                    transferred = 0
+                    while True:
+                        chunk = response.read(1 << 20)
+                        if not chunk:
+                            break
+                        transferred += len(chunk)
+                        if transferred > DEFAULT_MAX_VIDEO_BYTES:
+                            raise BadInput(
+                                f"video is over the {DEFAULT_MAX_VIDEO_BYTES} byte "
+                                "transfer cap — upload it through POST /file/upload "
+                                "and pass the path instead", resolved_url)
+                        out.write(chunk)
+            except BadInput:
+                raise
+            except Exception as error:  # noqa: BLE001 — surfaced to the caller
+                raise BadInput(f"cannot download {resolved_url!r}: {error}",
+                               resolved_url) from error
+            return handle.name, resolved_url, True
+
+        path = args.get("video_path") or args.get("path") or args.get("image_path")
+        if path:
+            resolved = check_under_roots(str(path), cfg,
+                                         url_action="recognize_video")
+            if os.path.isdir(resolved):
+                raise BadInput(f"{path!r} is a directory, not a video", str(path))
+            if not os.path.isfile(resolved):
+                raise BadInput(f"cannot read {path!r}: no such file", str(path))
+            return resolved, str(path), False
+
+        raise BadInput("one of video_path, image_path or url is required")
+
+    def _recognize_video(self, args: dict) -> dict:
+        """Sample a clip and judge what the people in it are doing.
+
+        The same engine, tracker and hybrid classifier the camera stream runs,
+        driven over decoded frames instead of a topic: sample at the card's
+        fps (never above the clip's own), bound the total frames, and aggregate
+        each track's stable activity labels over the whole clip. The reply
+        mirrors the lean stream payload — timestamp / count / persons /
+        latency_ms — so a consumer of {topic}/poses can read either.
+        """
+        cfg = dict(self._plugin_cfg)
+        started = time.time()
+        cleanup_path = None
+        try:
+            try:
+                video_path, source, cleanup = self._video_path(args, cfg)
+            except BadInput as error:
+                return error.as_result()
+            if cleanup:
+                cleanup_path = video_path
+
+            import cv2
+
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                cap.release()
+                return {
+                    "ok": False, "reason": "video_unreadable", "source": source,
+                    "detail": ("could not open that file as a video — check it is a "
+                               "real clip (mp4 et al.), not, say, HTML returned by a "
+                               "redirect"),
+                }
+            video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if video_fps <= 0 or total_frames <= 0:
+                cap.release()
+                return {
+                    "ok": False, "reason": "video_unreadable", "source": source,
+                    "detail": ("the container reports no frames or no fps — the clip "
+                               "is empty or its codec is unsupported"),
+                }
+
+            try:
+                model = self._require_engine()
+            except Exception as error:  # noqa: BLE001 — surfaced to the caller
+                cap.release()
+                log.error(f"[pose] engine load failed during recognize_video: {error}",
+                          exc_info=True)
+                return {"ok": False, "reason": "engine_unavailable",
+                        "source": source, "detail": str(error)}
+
+            confidence = args.get("confidence")
+            confidence = (float(confidence) if confidence not in (None, "")
+                          else self._confidence)
+
+            from plugins.vision_runtime import decode_poses
+
+            merged = self._merged_config(_DEFAULT_INSTANCE)
+            classifier = self._classifier_for(merged)
+            tracker = PoseTracker(history_s=classifier.history_s,
+                                  min_conf=merged["kpt_confidence"],
+                                  label_hold=merged["label_hold"])
+            interval = max(merged["activity_interval_s"], 0.0)
+            half_w, half_h = max(width / 2.0, 1.0), max(height / 2.0, 1.0)
+
+            # Sample at the card's fps, never above the clip's own, and bound
+            # the total: a 20-minute clip at 12 fps would be 14 400 inferences.
+            target_fps = min(max(1, merged["fps"]), video_fps)
+            stride = max(1, int(round(video_fps / target_fps)))
+            if (total_frames + stride - 1) // stride > MAX_VIDEO_FRAMES:
+                stride = max(stride, (total_frames + MAX_VIDEO_FRAMES - 1)
+                             // MAX_VIDEO_FRAMES)
+
+            per_track: dict = {}
+            frames_processed = 0
+            frame_index = 0
+            while frames_processed < MAX_VIDEO_FRAMES:
+                opened, frame = cap.read()
+                if not opened or frame is None:
+                    break
+                take = (frame_index % stride) == 0
+                frame_index += 1
+                if not take:
+                    continue
+                t = frames_processed * stride / video_fps
+                frames_processed += 1
+
+                outputs, meta = model.infer(frame)
+                boxes, scores, keypoints = decode_poses(outputs, meta, confidence)
+                order = np.argsort(np.asarray(scores, dtype=np.float32))[::-1]
+                order = order[:merged["max_persons"]]
+                if not len(order):
+                    continue
+                o_boxes = [boxes[i] for i in order]
+                o_kpts = [keypoints[i] for i in order]
+                tracks = tracker.update(o_boxes, o_kpts, t,
+                                        image_size=(width, height))
+                for track, box in zip(tracks, o_boxes):
+                    info = per_track.setdefault(track.id, {
+                        "frames": 0, "pos_x": 0.0, "pos_y": 0.0,
+                        "postures": {}, "activity_scores": {},
+                    })
+                    info["frames"] += 1
+                    cx = (float(box[0]) + float(box[2])) / 2.0
+                    cy = (float(box[1]) + float(box[3])) / 2.0
+                    info["pos_x"] += (cx - half_w) / half_w
+                    info["pos_y"] += (cy - half_h) / half_h
+
+                    # The learned backend is throttled exactly like the stream:
+                    # its window spans seconds, so two runs one frame apart
+                    # share most of their input and re-read the same motion.
+                    due = interval <= 0 or (t - track.activity_t) >= interval
+                    verdict = classifier.classify(list(track.history),
+                                                  want_activity=due)
+                    if due:
+                        track.activity_t = t
+                        track.activity = verdict.get("activity")
+                    else:
+                        verdict["activity"] = track.activity
+
+                    posture = verdict.get("posture")
+                    if posture:
+                        counts = info["postures"]
+                        counts[posture] = counts.get(posture, 0) + 1
+
+                    activity = verdict.get("activity")
+                    if activity and activity.get("name"):
+                        # Same hysteresis as the stream: a label must hold for
+                        # `label_hold` consecutive runs before it is believed,
+                        # so one flickering window cannot win the aggregation.
+                        # The Chinese name travels with the label: model labels
+                        # are not in the rules' ACTION_LABELS_ZH table.
+                        raw_name = activity["name"]
+                        name_zh = (activity.get("name_zh")
+                                   or ACTION_LABELS_ZH.get(raw_name, raw_name))
+                        stable_name, _ = track.activity_stabiliser.update(raw_name)
+                        if stable_name == raw_name:
+                            info["activity_scores"].setdefault(
+                                raw_name, []).append(
+                                    (float(activity["score"]), name_zh))
+                    else:
+                        track.activity_stabiliser.update("none")
+
+            cap.release()
+
+            persons = []
+            ranked = sorted(per_track.items(),
+                            key=lambda item: item[1]["frames"], reverse=True)
+            for rank, (_track_id, info) in enumerate(ranked, start=1):
+                record = {
+                    "id": rank,
+                    "position": [round(info["pos_x"] / info["frames"], 3),
+                                 round(info["pos_y"] / info["frames"], 3)],
+                }
+                postures = info["postures"]
+                if postures:
+                    posture, count = max(postures.items(), key=lambda kv: kv[1])
+                    record["posture"] = posture
+                    record["posture_confidence"] = round(count / info["frames"], 2)
+                if info["activity_scores"]:
+                    # The clip's verdict: the most frequent stable label, ties
+                    # broken by mean score. The reported confidence is the best
+                    # reading of that label — a mean would let one abstained
+                    # window drag the whole clip down.
+                    name, readings = max(
+                        info["activity_scores"].items(),
+                        key=lambda kv: (len(kv[1]),
+                                        sum(score for score, _ in kv[1])
+                                        / len(kv[1])))
+                    record["activity"] = name
+                    record["activity_zh"] = readings[-1][1]
+                    record["activity_score"] = round(
+                        max(score for score, _ in readings), 2)
+                persons.append(record)
+
+            duration_s = frames_processed * stride / video_fps
+            return {
+                "ok": True,
+                "source": source,
+                "video_size": [width, height],
+                "video_fps": round(video_fps, 3),
+                "duration_s": round(duration_s, 3),
+                "frames_processed": frames_processed,
+                "sampled_fps": (round(frames_processed / duration_s, 3)
+                                if duration_s > 0 else 0),
+                "temporal": True,
+                "timestamp": time.time(),
+                "count": len(persons),
+                # Nobody in the clip is a legitimate empty result — the TN row
+                # of the leaderboard table — not an error.
+                "persons": persons,
+                "latency_ms": int((time.time() - started) * 1000),
+            }
+        finally:
+            if cleanup_path is not None:
+                try:
+                    os.unlink(cleanup_path)
+                except OSError:
+                    pass
 
     def _hands_for_photo(self, persons: list, frame, merged: dict) -> tuple:
         """Run the hand channel over one photo. Returns a note for the reply.
@@ -1704,6 +2005,9 @@ class PosePerceptionPlugin:
 
         elif action in ("recognize_by_photo", "recognize_by_url"):
             return self._recognize_image(args, url_action="recognize_by_url")
+
+        elif action == "recognize_video":
+            return self._recognize_video(args)
 
         elif action == "list_actions":
             effective = self._effective_backend()
