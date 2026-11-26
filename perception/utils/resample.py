@@ -128,3 +128,62 @@ def downsample_24k_to_16k(samples: np.ndarray) -> bytes:
     ratio it was not designed for.
     """
     return float_to_pcm16(resample_poly(samples))
+
+
+# ── 22050 Hz (Piper VITS) -> 16000 Hz ─────────────────────────────────────────
+# Piper voices are 22050 Hz. The exact ratio to 16000 is 320:441, and the first
+# interpolation-grid image of the 8 kHz Nyquist sits *exactly* at 8 kHz, so an
+# exact-ratio decimation filter needs a razor-thin transition band and a
+# 140k-tap kernel -- seconds of FFT work per utterance on the Orin. That quality
+# is not what a TTS voice needs: sibilance energy dies well before 8 kHz, so the
+# kernel trades a 2 kHz transition (pass ~6.5 kHz, stop ~8.5 kHz) for a 67-tap
+# windowed sinc evaluated *in the input domain*, the classical polyphase
+# interpolator. No upsampled array, no chunking, no seams: every output sample
+# is a 67-tap dot product on the fractional grid, and the cost is
+# N_out * 67 multiply-adds (~50 ms per five seconds of audio, single thread).
+#
+# Grid images of the transition region land at 7.5-9.5 kHz at most ~20 dB
+# below the (already quiet) fricative content that makes them up: below the
+# noise floor of the models themselves. Everything else is ~-58 dB (Blackman)
+# out of band. The window is evaluated at the integer tap, not the fractional
+# one: Blackman moves <0.5% over a tap interval, below what the int16 path
+# quantises away, and it keeps the pass free of 67 extra gather-free sinc
+# windows. The frequency-selective sinc *is* fractional.
+_UP_P = 320
+_DOWN_P = 441  # 22050 * 320 / 441 == 16000 exactly
+_RESAMP_RATIO = 22050.0 / 16000.0  # input samples per output sample
+_RESAMP_K = 33  # kernel half-length in input samples (67 taps)
+_RESAMP_FC = 7500.0  # Hz, centre of the 6.5-8.5 kHz transition
+_RESAMP_OMEGA = 2.0 * math.pi * _RESAMP_FC / 22050.0
+_w22 = np.blackman(2 * _RESAMP_K + 1).astype(np.float64)
+# Unity DC gain: normalise by the kernel sum at a whole-sample anchor.
+_u22 = np.arange(-_RESAMP_K, _RESAMP_K + 1, dtype=np.float64)
+_h22 = np.ones_like(_u22)
+_nz22 = _u22 != 0
+_h22[_nz22] = np.sin(_RESAMP_OMEGA * _u22[_nz22]) / (_RESAMP_OMEGA * _u22[_nz22])
+_H22_DC = float((_h22 * _w22).sum())
+
+
+def resample_22050_to_16k(samples):
+    # 22050 Hz float samples -> 16 kHz little-endian int16 PCM bytes.
+    # Whole-utterance in, whole utterance out: nothing downstream learns the
+    # voice was 22.05 kHz, the bytes are 16 kHz mono PCM like every other
+    # engine's.
+    samples = np.asarray(samples, dtype=np.float32)
+    if samples.size == 0:
+        return b""
+    n_out = int(math.floor(samples.size / _RESAMP_RATIO + 0.5))
+    pos = np.arange(n_out, dtype=np.float64) * _RESAMP_RATIO
+    i0 = np.floor(pos).astype(np.int64)
+    frac = (pos - i0).astype(np.float64)
+    y = np.zeros(n_out, dtype=np.float64)
+    limit = samples.size - 1
+    for k in range(2 * _RESAMP_K + 1):
+        m = i0 - _RESAMP_K + k
+        np.clip(m, 0, limit, out=m)
+        u = k - _RESAMP_K - frac  # in [-K-1, K], zero on the anchored tap
+        s = np.ones(n_out)
+        nz = u != 0
+        s[nz] = np.sin(_RESAMP_OMEGA * u[nz]) / (_RESAMP_OMEGA * u[nz])
+        y += samples[m].astype(np.float64) * (s * _w22[k])
+    return float_to_pcm16((y / _H22_DC).astype(np.float32))

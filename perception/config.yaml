@@ -92,7 +92,14 @@ plugins:
 
   tts:
     enabled: true
-    engine: kokoro-multi
+    # board-multi: the eight-language composition for this board — kokoro for
+    # zh/en/ja/es/fr (the exact kokoro-multi path, untouched), MMS Thai for th,
+    # Piper int8 for de/ru. The de/ru/th voices build in background threads and
+    # degrade to the kokoro baseline per utterance if a host cannot fetch them,
+    # so readiness and the >=5-language admission rule never depend on them.
+    # Rollback to the previous five-language baseline is this one word:
+    #   engine: kokoro-multi
+    engine: board-multi
     backend: trt
     model_dir: /models/kokoro-multi
     # vits2-zh-en and mms-th support 0 only. For kokoro-multi this is an index
@@ -141,10 +148,13 @@ plugins:
     # CUDA provider falls back per node on quantised ops), so it carries its own
     # default in ENGINE_DEVICE_DEFAULTS — gpu. An explicit `cpu` here would apply
     # to every engine and quietly override that.
-    device: gpu  # Darvin TTS board: kokoro-multi fp32 on the Orin GPU (measured RTF ~0.07 on JP6)
-    # kokoro-multi only: pronunciation language. One of en-us, en-gb, zh, ja, es,
-    # fr, it, pt-br, hi — every language Kokoro v1.0 has voices for. Read per
-    # generate() call, so changing it costs nothing.
+    device: gpu  # Darvin TTS board: the board-multi/kokoro fp32 main engine on the Orin GPU (measured RTF ~0.07 on JP6); board sub-voices are cpu by construction
+    # Pronunciation language while no per-case value arrives. For board-multi
+    # this is the session fallback for text the script probe cannot assign (and
+    # the espeak voice for non-Chinese runs), one of en-us, en-gb, zh, ja, es,
+    # fr, it, pt-br, hi; per-utterance routing then still sends ru/th/de cases
+    # to their sub-voices. Read per generate() call, so changing it costs
+    # nothing.
     #
     # It selects the espeak voice for the NON-Chinese runs of the text; Chinese is
     # phonemised from lexicon-zh.txt on every setting, so mixed zh/en code-switches

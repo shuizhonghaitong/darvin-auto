@@ -1161,6 +1161,112 @@ def ensure_thai_tts_model(model_dir: str, progress_cb=None,
     return model_dir
 
 
+# ── Piper VITS voices for board languages Kokoro has no voices for (de, ru) ────
+# The two releases k2-fsa publishes on its tts-models asset track, medium
+# int8: one German (thorsten) and one Russian (dmitri) voice. Pinned the same
+# way as the other archives — size plus SHA256 of the release object, verified by
+# re-downloading and hashing, not by trusting a local copy.
+#
+# These come straight from the GitHub release rather than COS: the COS bucket is
+# where *we* publish objects we have built, and these two are upstream binaries
+# with an upstream checksum, so the upstream URL is the more honest source.
+# `PIPER_TTS_MODEL_BASE_URL` overrides it — if an eval host cannot reach GitHub,
+# the operator repacks the two archives verbatim (same names, same contents) to
+# COS and points the override there; the pins stay valid because the bytes are
+# identical.
+#
+# Each archive carries one top-level directory, the voice's name, holding the
+# onnx weights, its tokens.txt and its own espeak-ng-data. ensure_verified_archive
+# keeps that directory as-is; the adapter reads the entry's `dir`/`model` fields
+# to find the files, so a repacked archive with a different top-level name still
+# installs.
+#
+# 22050 Hz, not the pipeline's 16000: the conversion is
+# utils/resample.resample_22050_to_16k, the same reason the Kokoro release is
+# converted in downsample_24k_to_16k. int8 on CPU — ONNX Runtime's CUDA EP has no
+# int8 kernels, so a gpu session would fall back per node and only be slower.
+#
+# Licence: the voices are MIT (see the licence file inside each archive), which
+# also makes them the lighter-weight choice for the board over the CC-BY-NC MMS
+# releases.
+PIPER_TTS_MODEL_BASE = os.environ.get(
+    "PIPER_TTS_MODEL_BASE_URL",
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models",
+)
+# Optional second candidate, tried only when the primary fails. The eval
+# network this board runs on (a Chinese internal rack) cannot reach GitHub
+# release assets — measured: the TCP connect succeeds and then the first read
+# hangs for the whole 120 s timeout, three attempts per archive. A team
+# operator who repacks the two archives verbatim to a reachable host (the COS
+# public bucket works, the pinned size/SHA256 stay valid because the bytes are
+# identical) exports PIPER_TTS_MIRROR_BASE_URL and the voices install from
+# there. Nothing here depends on the mirror existing.
+PIPER_TTS_MIRROR_BASE = os.environ.get("PIPER_TTS_MIRROR_BASE_URL", "")
+PIPER_TTS_ARCHIVES = {
+    "de": {
+        "archive": "vits-piper-de_DE-thorsten-medium-int8.tar.bz2",
+        "dir": "vits-piper-de_DE-thorsten-medium-int8",
+        "model": "de_DE-thorsten-medium.onnx",
+        "size": 20949833,
+        "sha256": "07e240b7b9c1fc9211d5a69512f8cbe11b3286c2ed79c15c076ac6ed427fdf13",
+    },
+    "ru": {
+        "archive": "vits-piper-ru_RU-dmitri-medium-int8.tar.bz2",
+        "dir": "vits-piper-ru_RU-dmitri-medium-int8",
+        "model": "ru_RU-dmitri-medium.onnx",
+        "size": 21129441,
+        "sha256": "7636793307f634ce54c6e65528a91a61683114f1a6635a08caf64ba6c54e6a63",
+    },
+}
+
+
+def ensure_piper_tts_model(kind: str, model_dir: str, progress_cb=None,
+                           stage_cb=None) -> str:
+    """Ensure the Piper VITS voice for `kind` is installed; return its directory.
+
+    Returns the voice's own directory (the archive's top-level name), not
+    `model_dir`: the espeak-ng data dir and the tokens table sit inside it, and
+    handing the caller the parent would force it to know the name.
+    """
+    if kind not in PIPER_TTS_ARCHIVES:
+        raise ValueError(
+            f"unknown Piper TTS kind {kind!r}; expected one of {sorted(PIPER_TTS_ARCHIVES)}"
+        )
+    model_dir = require_models_subpath(model_dir)
+    entry = PIPER_TTS_ARCHIVES[kind]
+    # The name carries the kind, so de and ru cannot share a marker even though
+    # they are both ensure_verified_archive installs.
+    urls = [f"{PIPER_TTS_MODEL_BASE.rstrip('/')}/{entry['archive']}"]
+    if PIPER_TTS_MIRROR_BASE:
+        urls.append(f"{PIPER_TTS_MIRROR_BASE.rstrip('/')}/{entry['archive']}")
+    last_error = None
+    for url in urls:
+        try:
+            ensure_verified_archive(
+                f"piper-{kind}/{entry['archive']}",
+                model_dir,
+                url,
+                entry,
+                progress_cb=progress_cb,
+                stage_cb=stage_cb,
+            )
+            last_error = None
+            break
+        except Exception as error:  # noqa: BLE001 - fall through to the next source
+            last_error = error
+            log.warning(f"[model_downloader] piper-{kind}: source failed, "
+                        f"trying next: {error}")
+    if last_error is not None:
+        raise last_error
+    voice_dir = os.path.join(model_dir, entry["dir"])
+    for name in (entry["model"], "tokens.txt", "espeak-ng-data"):
+        if not os.path.exists(os.path.join(voice_dir, name)):
+            raise FileNotFoundError(
+                f"Piper {kind} voice is incomplete: {os.path.join(voice_dir, name)} is missing"
+            )
+    return voice_dir
+
+
 # ── Kokoro TTS (Kokoro-82M v1.0, 24 kHz, ONNX; one archive per device) ─────────
 # Keyed by **device**, not by JetPack family: Kokoro is plain ONNX Runtime, so
 # unlike the VITS2 TensorRT plans above there is nothing tied to a TensorRT major

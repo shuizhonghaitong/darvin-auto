@@ -296,12 +296,14 @@ TOOLS = [
                 # without rebuilding the image. Mirrors asr_model in asr.py.
                 "tts_engine": {"type": "string",
                                "enum": ["vits2-zh-en", "matcha-zh-en", "mms-th",
-                                        "kokoro-multi"],
+                                        "kokoro-multi", "board-multi"],
                                "description": "TTS engine, named <model>-<languages> to match "
                                               "asr_model (vits2-zh-en = VITS2 on TensorRT, "
                                               "matcha-zh-en = Matcha-icefall, "
                                               "mms-th = MMS Thai, "
-                                              "kokoro-multi = Kokoro-82M v1.0)",
+                                              "kokoro-multi = Kokoro-82M v1.0, "
+                                              "board-multi = eight-language board: kokoro "
+                                              "plus MMS Thai and Piper de/ru)",
                                "default": "vits2-zh-en", "scope": "shared"},
                 # matcha-zh-en, mms-th and kokoro-multi only — vits2-zh-en is a
                 # TensorRT engine and never touches ONNX Runtime, so this field does
@@ -318,7 +320,8 @@ TOOLS = [
                                                "int8 on cpu",
                                 "default": "cpu", "scope": "shared",
                                 "x-show-when": {"tts_engine": ["matcha-zh-en", "mms-th",
-                                                               "kokoro-multi"]}},
+                                                               "kokoro-multi",
+                                                               "board-multi"]}},
                 # Kokoro takes `lang` per generate() call, so this is a scale on the
                 # resident model like `speed` — not a session key.
                 #
@@ -338,12 +341,16 @@ TOOLS = [
                 "tts_language": {
                     "type": "string",
                     "enum": ["en-us", "en-gb", "zh", "ja", "es", "fr", "it",
-                             "pt-br", "hi"],
-                    "description": "Pronunciation language for kokoro-multi. Chinese is "
+                             "pt-br", "hi", "ru", "th", "de"],
+                    "description": "Pronunciation language for kokoro-multi (Chinese is "
                                    "spoken correctly on any setting; this picks the espeak "
-                                   "voice for the non-Chinese parts of the text",
+                                   "voice for the non-Chinese parts of the text). For "
+                                   "board-multi this is one of the eight board codes — "
+                                   "ru/th/de select the Piper/MMS sub-voices, the rest "
+                                   "kokoro; per-utterance detection applies while no "
+                                   "value is set",
                     "default": "en-us", "scope": "shared",
-                    "x-show-when": {"tts_engine": ["kokoro-multi"]}},
+                    "x-show-when": {"tts_engine": ["kokoro-multi", "board-multi"]}},
                 # Thai has no spaces between words, and MMS was trained on text
                 # that spaced only phrase boundaries. Segmenting every word may
                 # help prosody or hurt it — off until it has been A/B'd on device.
@@ -887,6 +894,7 @@ class KokoroTTSAdapter(TTSAdapter):
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
                  device: str = "gpu", language: str = DEFAULT_LANGUAGE,
                  japanese_worker: bool = True, japanese_worker_device: str = "gpu",
+                 japanese_via_sherpa: bool = False,
                  on_status=None):
         import os
         from utils.model_downloader import ensure_kokoro_model
@@ -984,6 +992,11 @@ class KokoroTTSAdapter(TTSAdapter):
         self._provider = provider
         self._japanese_worker = bool(japanese_worker)
         self._japanese_worker_device = japanese_worker_device
+        # board-multi only: keep Japanese in the sherpa session (romaji + the
+        # Latin espeak voice) instead of the KokoroDirect runtime, because a
+        # second in-process ONNX Runtime corrupts the other sessions — see
+        # BoardMultiTTSAdapter. Baseline kokoro-multi keeps the direct path.
+        self._ja_via_sherpa = bool(japanese_via_sherpa)
 
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
@@ -1323,14 +1336,22 @@ class KokoroTTSAdapter(TTSAdapter):
                else self._resolve_sid(self._voice_index, language, strict=False))
 
         if language == "ja":
-            # Japanese leaves sherpa entirely. Its frontend phonemises with espeak,
-            # whose alphabet Kokoro's misaki-derived vocabulary cannot represent, and
-            # drops the misses — 12 phonemes from one sentence, audible as holes.
-            # plugins/ja_phonemes produces the phonemes the model was actually
-            # trained on, and plugins/kokoro_direct feeds them to the graph, because
-            # sherpa has no phoneme input path.
-            yield from self._synthesize_japanese(text, language)
-            return
+            if self._ja_via_sherpa:
+                # Same graph, no second ONNX Runtime: kanji -> counters/numbers ->
+                # romaji (JapaneseFrontend.normalize), then the espeak voice the
+                # LANGUAGE_VOICES table already picks for ja — "it", the measured
+                # 0-dropped-phonemes Latin voice for romaji (see the "ja" entry).
+                # voice and sid below are resolved for ja as usual.
+                text = self._ja().normalize(text)
+            else:
+                # Japanese leaves sherpa entirely. Its frontend phonemises with
+                # espeak, whose alphabet Kokoro's misaki-derived vocabulary cannot
+                # represent, and drops the misses — 12 phonemes from one sentence,
+                # audible as holes. plugins/ja_phonemes produces the phonemes the
+                # model was actually trained on, and plugins/kokoro_direct feeds
+                # them to the graph, because sherpa has no phoneme input path.
+                yield from self._synthesize_japanese(text, language)
+                return
 
         # One generate() at a time. sherpa-onnx's OfflineTts is not documented as
         # thread-safe, and dispatch() runs on a ThreadingHTTPServer thread per
@@ -1513,6 +1534,465 @@ def _validate_kokoro_manifest(model_dir: str) -> dict:
     return manifest
 
 
+class PiperVitsTTSAdapter(TTSAdapter):
+    """On-device Piper VITS voice for one board language (22.05 kHz).
+
+    The sub-engine the board uses for the two languages Kokoro has no
+    voices for: German and Russian (see BoardMultiTTSAdapter). Structurally
+    the same shape as the other two sherpa-onnx VITS adapters — Matcha and
+    MMS Thai — with two differences:
+
+    - The text frontend is espeak-ng, so the session needs `data_dir` on the
+      voice's own espeak-ng-data directory and an empty lexicon; MMS Thai has
+      neither, being character-level.
+    - Its sample rate is 22050, not the pipeline's 16000, so the output goes
+      through utils.resample.resample_22050_to_16k — the same reason Kokoro's
+      24 kHz is converted in downsample_24k_to_16k. Nothing outside this class
+      knows the voice was 22.05 kHz.
+
+    int8 on CPU on purpose: ONNX Runtime's CUDA EP has no int8 kernels, so a
+    gpu session would fall back per node and only be slower. The board's
+    kokoro main engine keeps the gpu; these are small non-autoregressive
+    voices where the Orin's CPU is plenty (measured RTF well under 1 on x86).
+    """
+
+    # One vowel each — in the script of the voice — that every espeak-ng data
+    # set ships. The probe runs at construction (see below), so a broken
+    # espeak directory cannot hide until the first German utterance.
+    _DRY_RUN = {"de": "a", "ru": "а"}
+
+    # Maximum characters per generate() call on the Jetson aarch64 ORT build.
+    # The limit is in **phoneme tokens, not characters**: the int8 medium
+    # graph (both voices, same 3048-node structure) fails every input whose
+    # espeak phonemisation is long enough, at
+    # /dp/flows.5/ConstantOfShape_11 with "Non-zero status code", and a few
+    # such failures then kill the session for good (a Reshape error on the
+    # next short input). Measured on the Orin (JP6.1, this repo's image),
+    # fresh process, one session:
+    #
+    #     ru: 100-char text ok, 110-char text fail      (~1.35 phonemes/char)
+    #     de: 100-char text ok, 110-char text fail      (~1.05 phonemes/char)
+    #     both voices: the same 98-char sentence ok
+    #
+    # so the token edge sits near 128 phonemes, text-dependent. The same
+    # graph at 425 chars is fine on x86, which makes this an aarch64 int8
+    # kernel bug in the duration-predictor flow rather than a model limit —
+    # but the board runs on aarch64, so the cap is real. 70 chars keeps even
+    # the densest Russian well under the edge (~95 phonemes). The cost is
+    # one generate() per ~70 chars, measured ~0.5-1.5 s on the Orin CPU: an
+    # 800-char case is twelve calls, RTF still ~0.3.
+    _MAX_CHARS = 70
+
+    def __init__(self, kind: str, model_dir: str, speed: float = 1.0,
+                 device: str = "cpu", on_status=None):
+        import os
+        from utils.model_downloader import PIPER_TTS_ARCHIVES, ensure_piper_tts_model
+        from utils.model_progress import fetch_status
+
+        if kind not in PIPER_TTS_ARCHIVES:
+            raise ValueError(f"unknown Piper voice {kind!r}; expected one of {sorted(PIPER_TTS_ARCHIVES)}")
+        if device != "cpu":
+            # The board builds sub-engines as "cpu" always; a hand-built
+            # session must not silently take the slower path either.
+            log.warning("[tts] piper %s: int8 model requested on %s — using cpu", kind, device)
+            device = "cpu"
+
+        self._kind = kind
+        self._speed = speed
+        piper_cb, piper_stage = fetch_status(on_status, f"piper-{kind}")
+        entry = PIPER_TTS_ARCHIVES[kind]
+        voice_dir = ensure_piper_tts_model(kind, model_dir, progress_cb=piper_cb,
+                                           stage_cb=piper_stage)
+        model_path = os.path.join(voice_dir, entry["model"])
+        tokens_path = os.path.join(voice_dir, "tokens.txt")
+        data_dir = os.path.join(voice_dir, "espeak-ng-data")
+
+        import sherpa_onnx
+
+        self._tts_config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=model_path,
+                    tokens=tokens_path,
+                    data_dir=data_dir,
+                    lexicon="",
+                    length_scale=1.0 / speed if speed else 1.0,
+                ),
+                # Two threads, not four: the 3-instance OOM fix (e402b69) caps
+                # every resident session at 2, and int8 piper is small enough
+                # that the extra threads buy nothing but RAM on the shared Orin.
+                num_threads=2,
+                provider="cpu",
+            ),
+            rule_fsts="",
+        )
+        self._tts = sherpa_onnx.OfflineTts(self._tts_config)
+        self._rebuilds = 0
+        if int(getattr(self._tts, "sample_rate", 0) or 0) != 22050:
+            raise RuntimeError(
+                f"Piper {kind} voice is not 22050 Hz; the resampler is "
+                "designed for that rate"
+            )
+        # Fail at construction, mirroring MmsThaiTTSAdapter's dry-run check: a
+        # sub-engine that cannot speak must end up `state: error` in
+        # BoardMultiTTSAdapter._sub_state — which degrades its language to the
+        # kokoro baseline per utterance — not in an exception inside the first
+        # real utterance.
+        probe = self._tts.generate(self._DRY_RUN[kind], sid=0, speed=1.0)
+        if not (probe.samples and len(probe.samples) > 0):
+            raise RuntimeError(f"Piper {kind} dry-run produced no audio")
+        self.dry_run_text = self._DRY_RUN[kind]
+        log.info(f"[tts] piper {kind} loaded: {voice_dir}, speed={speed}, "
+                 f"provider=cpu, sample_rate=22050 (resampled to {SAMPLE_RATE})")
+
+    def synthesize(self, text: str) -> bytes:
+        return b''.join(self.synthesize_stream(text))
+
+    def _rebuild(self):
+        """Drop the session and build a fresh one from the same config.
+
+        This piper graph on the Orin aarch64 ORT build degrades with use:
+        measured on the Jetson debug box (this repo's image, one session,
+        one input stream), 60-char chunks that were 10/10 reliable on a
+        fresh session failed 3/10 after ~20 generations and 7/10 after
+        ~35 — intermittent Range/Reshape/GatherElements errors inside the
+        duration-predictor flow, with a healthy session in between. 270-char
+        inputs also succeeded on fresh sessions, so it is not a length
+        ceiling; it is per-session lifetime, and the only clean reset is a
+        new OfflineTts. A rebuild is ~1-2 s on the Orin (weights already on
+        disk), so one failed chunk per case is survivable.
+        """
+        import sherpa_onnx
+        log.warning("[tts] piper %s: rebuilding the ONNX session "
+                    "(%d rebuilds so far)", self._kind, self._rebuilds)
+        self._tts = sherpa_onnx.OfflineTts(self._tts_config)
+        self._rebuilds += 1
+
+    def synthesize_stream(self, text: str):
+        import numpy as np
+        from utils.resample import resample_22050_to_16k
+
+        # The caller bounds text to RAW_SYNTH_MAX_CHARS (280), but the aarch64
+        # graph wants the tighter _MAX_CHARS chunks (see above) — segment
+        # here, on sentence boundaries where they exist, and concatenate the
+        # chunks' audio. The baseline kokoro path does the same at 280.
+        for chunk in _bounded_segments(text, max_chars=self._MAX_CHARS):
+            try:
+                audio = self._tts.generate(chunk, sid=0, speed=self._speed)
+            except Exception as first_error:
+                # One rebuild + one retry per chunk. If the fresh session
+                # fails the same chunk too, propagate: the case is lost,
+                # but the next case gets a fresh session.
+                self._rebuild()
+                audio = self._tts.generate(chunk, sid=0, speed=self._speed)
+            samples = np.asarray(audio.samples, dtype=np.float32)
+            if samples.size:
+                yield resample_22050_to_16k(samples)
+
+    def set_speed(self, speed: float) -> None:
+        # sherpa-onnx applies `speed` per generate() call, so nothing reloads —
+        # the same as the other adapters.
+        self._speed = speed
+
+
+class BoardMultiTTSAdapter(TTSAdapter):
+    """Eight-language board routing: one utterance, one engine.
+
+    zh/en/ja/es/fr go to KokoroTTSAdapter — the baseline kokoro-multi path,
+    untouched; th to MmsThaiTTSAdapter (16 kHz natively, already shipped in
+    the image); de and ru to PiperVitsTTSAdapter (22.05 kHz, resampled).
+
+    The sub-engines build in background threads rather than inline, for the
+    board's admission rules:
+
+    - /ready gates on the TTS engine being built. The main engine is kokoro
+      and is built inline exactly as for kokoro-multi, so a host that cannot
+      reach the sub-engine mirrors still serves all six kokoro languages —
+      five or more, the language-coverage minimum — and can become ready.
+    - A failed sub-engine (download or load) degrades to the kokoro baseline
+      per utterance, which is exactly what kokoro-multi already did for
+      those languages (cyrillic read by an espeak fallback voice). It never
+      takes the service down.
+
+    Language per utterance: an explicit session language (the `language`
+    field of /tts/test, or the `config` action) wins; otherwise the script
+    and stopword probe kokoro-multi already uses decides, and text it
+    cannot assign stays on kokoro.
+    """
+
+    # "ok" routes to kokoro (en) — the engine /ready and the start() dry-run
+    # depend on — and is kokoro's own probe, so the board's readiness never
+    # waits on a sub-engine.
+    dry_run_text = "ok"
+
+    # Labels that route off kokoro, in the spellings the board and operators
+    # actually use. Everything else — zh, ja, en, es, fr, it, unknowns —
+    # stays on kokoro, the baseline behaviour for any language.
+    _SUB_LABELS = {
+        "ru": "ru", "ru-ru": "ru",
+        "th": "th", "th-th": "th",
+        "de": "de", "de-de": "de",
+    }
+
+    # kind -> (status label, model directory under the shared /models).
+    _SUB_MODELS = {
+        "th": ("mms-th", "/models/mms-th"),
+        "de": ("piper-de", "/models/piper-de"),
+        "ru": ("piper-ru", "/models/piper-ru"),
+    }
+
+    # Cyrillic -> Latin, GOST-ish romanisation. Only ever used as a
+    # last-resort feed for the kokoro engine when a sub-engine is down: see
+    # _sanitize_for_kokoro for why raw Cyrillic must never reach it.
+    _CYR_TO_LATIN = {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+        "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+        "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+        "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+        "ъ": " ", "ы": "y", "ь": " ", "э": "e", "ю": "yu", "я": "ya",
+        "і": "i", "ї": "yi", "є": "ye", "ґ": "g",        # uk-ish variants
+    }
+    _CRASH_SCRIPT_RE = re.compile("[\u0400-\u04ff\u0e00-\u0e7f]")
+
+    def _sanitize_for_kokoro(self, text: str) -> str:
+        """Make text speakable by kokoro's espeak path without corrupting it.
+
+        Measured on Orin 6 (fp32 CUDA session): one generate() whose text
+        carries Cyrillic or Thai script under a non-CJK espeak voice fails
+        inside the graph's autoregressive Loop with "SequenceInsert:
+        IsSameDataType(tensor) was false" — and the *session* stays broken:
+        every later generate() in other languages then fails in ~100 ms,
+        which turns one unreadable Russian case into a dead card for the
+        rest of the evaluation. The Japanese path is immune (KokoroDirect
+        keeps its own CPU session), which is how the corruption was
+        isolated.
+
+        So any such character that would reach the espeak path is converted:
+        Cyrillic is romanised (the words survive, the accent does not — a
+        price worth paying against a dead session), Thai is dropped (there
+        is no Latin shape for it, and it only appears here when the Thai
+        sub-engine itself is down). Text without these scripts passes
+        through byte-identical.
+        """
+        if not self._CRASH_SCRIPT_RE.search(text):
+            return text
+        out = []
+        for ch in text:
+            low = ch.lower()
+            if ch in self._CYR_TO_LATIN:
+                out.append(self._CYR_TO_LATIN[ch])
+            elif low in self._CYR_TO_LATIN:
+                out.append(self._CYR_TO_LATIN[low])
+            elif "\u0e00" <= ch <= "\u0e7f":
+                out.append(" ")
+            else:
+                out.append(ch)
+        return re.sub(r"\s+", " ", "".join(out)).strip()
+
+    # How long one utterance waits for a sub-engine that is still building.
+    # Sized over the session-construction cost (~2 s cpu per voice, measured
+    # on x86) plus a short download tail; a download longer than this means
+    # the host is slow enough that the kokoro baseline for that one
+    # utterance is the honest answer.
+    _SUB_WAIT_S = 10.0
+
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
+                 device: str = "gpu", language: str = KokoroTTSAdapter.DEFAULT_LANGUAGE,
+                 japanese_worker: bool = True, japanese_worker_device: str = "gpu",
+                 on_status=None):
+        import threading
+
+        # The main engine builds inline: it is what the /ready probe and the
+        # start() dry-run depend on, so a failure here is a build failure,
+        # the same as for kokoro-multi. The sub-engines take none of these
+        # arguments — single-speaker CPU voices — so they cannot inherit a
+        # mismatched speaker id or a gpu default.
+        self._kokoro = KokoroTTSAdapter(
+            model_dir, speaker_id, speed, device,
+            language=language,
+            japanese_worker=japanese_worker,
+            japanese_worker_device=japanese_worker_device,
+            # The board runs three instances on one shared-memory Orin, and a
+            # second in-process ONNX Runtime (the in-process Japanese path) was
+            # measured corrupting every later generate() in the process — the
+            # standalone 1.18 library and sherpa's bundled one interpose each
+            # other's C symbols, so the CUDA session dies with "SequenceInsert:
+            # IsSameDataType false" and the CPU piper/mms sessions die with
+            # "ConstantOfShape". Keeping ja inside the sherpa session is the
+            # only configuration in which all resident engines share one ORT.
+            # Quality cost vs the misaki-phoneme path: the "it"-voice romaji form,
+            # which the measurements above record as 0 dropped phonemes.
+            japanese_via_sherpa=True,
+            on_status=on_status,
+        )
+        self._explicit_language = ""
+        self._speed = speed
+        self._sub_state = {
+            kind: {"state": "building", "adapter": None, "error": None}
+            for kind in self._SUB_MODELS
+        }
+        self._sub_lock = threading.Condition()
+        # Sub-engine sessions are consumed under one lock: sherpa's
+        # OfflineTts is not thread-safe, and /tts/test is served from a
+        # ThreadingHTTPServer, so two pipelined cases could otherwise
+        # generate() into the same piper/mms session concurrently. Kokoro
+        # has its own _lock for exactly this reason (see its
+        # synthesize_stream); the sub-engines get the board's instead, so
+        # one lock serialises all three of them — they are all cpu and all
+        # short, so the cost is nothing but safety.
+        self._sub_synth_lock = threading.Lock()
+        # One thread per sub-engine rather than one walking the list: the
+        # three fetches go to different hosts (COS for th, GitHub for de and
+        # ru) and the lock inside ensure_verified_archive already serialises
+        # multi-instance installs, so the wall clock is the slowest fetch,
+        # not their sum.
+        for kind, thread_name in (("th", "tts-board-th"), ("de", "tts-board-de"),
+                                  ("ru", "tts-board-ru")):
+            threading.Thread(target=self._load_sub, args=(kind,),
+                             name=thread_name, daemon=True).start()
+        log.info("[tts] board-multi: kokoro main engine up; "
+                 "th/de/ru sub-engines loading in the background")
+
+    def _load_sub(self, kind: str) -> None:
+        name, model_dir = self._SUB_MODELS[kind]
+        try:
+            if kind == "th":
+                adapter = MmsThaiTTSAdapter(model_dir, 0, self._speed, "cpu")
+            else:
+                adapter = PiperVitsTTSAdapter(kind, model_dir, self._speed, "cpu")
+        except Exception as exc:  # noqa: BLE001 - recorded, never propagated
+            with self._sub_lock:
+                self._sub_state[kind].update(state="error", error=str(exc))
+                self._sub_lock.notify_all()
+            log.warning(
+                "[tts] board sub-engine %s (%s) failed to build; its language "
+                "falls back to the kokoro baseline per utterance: %s",
+                kind, name, exc)
+            return
+        with self._sub_lock:
+            self._sub_state[kind].update(state="ready", adapter=adapter)
+            self._sub_lock.notify_all()
+        log.info("[tts] board sub-engine %s (%s) ready", kind, name)
+
+    # Characters German uses and no other board language does. The shared
+    # stopword probe needs two distinct hits, so a short German sentence with
+    # one or zero (the list is not exhaustive) falls through to kokoro — and
+    # kokoro has no German voice, it would read the sentence with the English
+    # espeak voice. One of these characters is strong evidence on its own:
+    # Spanish and French, the other board languages that use Latin diacritics,
+    # do not use any of them.
+    _DE_CHARS_RE = re.compile(r"[\u00df\u00e4\u00f6\u00fc\u00c4\u00d6\u00dc]")
+
+    def _route(self, text: str) -> str:
+        """The engine one utterance goes to: a sub-engine kind or 'kokoro'."""
+        if self._explicit_language:
+            label = self._explicit_language.strip().lower()
+        else:
+            label = self._kokoro._detect_language(text)
+            if label is None:
+                label = self._detect_german_fallback(text)
+        return self._SUB_LABELS.get(label or "", "kokoro")
+
+    def _detect_german_fallback(self, text: str):
+        """Route Latin text the shared probe left undecided, when it carries a
+        German-only character and enough German shape around it to not be an
+        English sentence that merely borrowed one word. Returns 'de' or None;
+        only ever consulted when _detect_language gave up."""
+        if not text or not self._DE_CHARS_RE.search(text):
+            return None
+        tokens = set(re.findall(r"[a-z\u00e0-\u00ff]+", text.lower()))
+        if not tokens:
+            return None
+        de_hits = len(tokens & KokoroTTSAdapter._LATIN_STOPWORDS["de"])
+        if de_hits >= 1:
+            return "de"
+        # No stopword: the diacritic plus a real word count — a one- or
+        # two-word fragment is not worth overriding the probe for.
+        if len(tokens) >= 3:
+            return "de"
+        return None
+
+    def _sub_for(self, kind: str):
+        """The ready sub-engine for `kind`, or None: not ready, failed, or
+        still building past the wait — each of which is the kokoro baseline
+        for this utterance, and the caller says which in its log line."""
+        import time
+        deadline = time.monotonic() + self._SUB_WAIT_S
+        with self._sub_lock:
+            while True:
+                state = self._sub_state[kind]
+                if state["state"] != "building":
+                    return state["adapter"]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._sub_lock.wait(remaining)
+
+    def synthesize(self, text: str) -> bytes:
+        return b''.join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        kind = self._route(text)
+        if kind == "kokoro":
+            yield from self._kokoro.synthesize_stream(
+                self._sanitize_for_kokoro(text))
+            return
+        adapter = self._sub_for(kind)
+        if adapter is None:
+            log.warning("[tts] board sub-engine %s not usable (%s); falling "
+                        "back to kokoro for this utterance", kind,
+                        self._sub_state[kind]["state"])
+            # The fallback reads the text by its own script, not by whatever
+            # explicit language a previous case left on the session: exp-zh
+            # before exp-ru would otherwise make the Russian fallback be read
+            # under the Chinese setting. Restore afterwards, because the
+            # sticky language is still in force for languages kokoro owns.
+            prev_explicit = self._kokoro._language_explicit
+            self._kokoro._language_explicit = False
+            try:
+                fallback = self._sanitize_for_kokoro(text)
+                if fallback:
+                    yield from self._kokoro.synthesize_stream(fallback)
+            finally:
+                self._kokoro._language_explicit = prev_explicit
+            return
+        with self._sub_synth_lock:
+            yield from adapter.synthesize_stream(text)
+
+    def set_language(self, language: str) -> None:
+        """Sticky, mirroring kokoro-multi: the last explicit language wins
+        until another arrives. Forwarded to kokoro only when kokoro is the
+        engine that will speak it — an ru/th/de label is the sub-engine's,
+        and pushing it at kokoro would cost a normalisation warning per
+        utterance in that language for nothing."""
+        self._explicit_language = language
+        if self._SUB_LABELS.get(language.strip().lower()) is None:
+            self._kokoro.set_language(language)
+
+    def set_speed(self, speed: float) -> None:
+        self._speed = speed
+        self._kokoro.set_speed(speed)
+        with self._sub_lock:
+            adapters = [s["adapter"] for s in self._sub_state.values()
+                        if s["state"] == "ready"]
+        for adapter in adapters:
+            adapter.set_speed(speed)
+
+    def close(self) -> None:
+        self._kokoro.close()
+        with self._sub_lock:
+            adapters = [s["adapter"] for s in self._sub_state.values()
+                        if s["adapter"] is not None]
+        for adapter in adapters:
+            closer = getattr(adapter, "close", None)
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[tts] closing a board sub-engine failed: %s", exc)
+
+
 def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
     import os
     from utils.onnx_provider import normalize_device
@@ -1546,6 +2026,19 @@ def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
             # graph can coexist with sherpa's. Not exposed in configSchema: it is a
             # correctness constraint, not an operator preference. config.yaml can
             # turn it off to fall back to the in-process CPU session.
+            japanese_worker=bool(cfg.get('japanese_worker', True)),
+            japanese_worker_device=str(cfg.get('japanese_worker_device') or 'gpu'),
+            on_status=on_status,
+        )
+    if engine == 'board-multi':
+        # Same arguments as the kokoro branch: the main engine *is* kokoro,
+        # and the board's config.yaml is written for it. Sub-engine voices
+        # are single-speaker CPU models with fixed directories, so they take
+        # none of these.
+        return BoardMultiTTSAdapter(
+            model_dir, speaker_id, speed, device,
+            language=(cfg.get('tts_language') or cfg.get('language')
+                      or KokoroTTSAdapter.DEFAULT_LANGUAGE),
             japanese_worker=bool(cfg.get('japanese_worker', True)),
             japanese_worker_device=str(cfg.get('japanese_worker_device') or 'gpu'),
             on_status=on_status,
@@ -2331,7 +2824,7 @@ DEFAULT_TTS_ENGINE = "vits2-zh-en"
 # `matcha` and `mms-th` both run on sherpa-onnx.
 #
 # Language codes, not country codes: `zh`, not `cn`.
-TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi")
+TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi", "board-multi")
 # What each engine can speak, in the codes the rest of this file uses. Answered
 # by action=support_language straight from the facade: it is a property of the
 # engine, not of a loaded model, so it works while an engine is still loading.
@@ -2342,6 +2835,10 @@ ENGINE_LANGUAGES = {
     "matcha-zh-en": ("zh", "en"),
     "mms-th": ("th",),
     "kokoro-multi": KokoroTTSAdapter.LANGUAGES,
+    # The eight board languages, in the codes the board posts cases in:
+    # six on kokoro, th on MMS Thai, de and ru on Piper (see
+    # BoardMultiTTSAdapter._SUB_LABELS).
+    "board-multi": ("zh", "en", "ja", "ru", "es", "fr", "th", "de"),
 }
 # Older spellings, still accepted. `vits2_trt` and `sherpa_onnx` are not
 # decoration: both are already persisted in ConfigDB rows and in config.yaml on
@@ -2372,6 +2869,12 @@ ENGINE_MODEL_DIRS = {
     # it: the two devices load different weight files (fp32 vs int8), so they are
     # separate downloads that must not overwrite each other.
     "kokoro-multi": "/models/kokoro-multi",
+    # The main engine's tree — the board's kokoro. Its de/ru/th sub-voices
+    # live in their own ENGINE-less directories (/models/piper-de,
+    # /models/piper-ru, /models/mms-th), hardcoded in
+    # BoardMultiTTSAdapter._SUB_MODELS, because they are part of the board
+    # composition, not a selectable engine.
+    "board-multi": "/models/kokoro-multi",
 }
 # Where an engine wants to run when nothing has been configured. Only Kokoro
 # differs: it is a 310 MB fp32 graph on gpu and the CUDA provider is worth having,
@@ -2384,6 +2887,9 @@ ENGINE_MODEL_DIRS = {
 # instead.
 ENGINE_DEVICE_DEFAULTS = {
     "kokoro-multi": "gpu",
+    # Same reason as kokoro-multi: the main engine is that fp32 graph, and
+    # the device field is about it. The sub-voices are cpu by construction.
+    "board-multi": "gpu",
 }
 # How long an `action=config` engine switch waits for the new engine before
 # answering `loading`. Sized so the bounded part of a build finishes inside it
