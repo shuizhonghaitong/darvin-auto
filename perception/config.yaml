@@ -92,14 +92,17 @@ plugins:
 
   tts:
     enabled: true
-    # board-multi: the eight-language composition for this board — kokoro for
-    # zh/en/ja/es/fr (the exact kokoro-multi path, untouched), MMS Thai for th,
-    # Piper int8 for de/ru. The de/ru/th voices build in background threads and
-    # degrade to the kokoro baseline per utterance if a host cannot fetch them,
-    # so readiness and the >=5-language admission rule never depend on them.
-    # Rollback to the previous five-language baseline is this one word:
-    #   engine: kokoro-multi
-    engine: board-multi
+    # board-xiaoyou: the eight-language composition for this board with the
+    # zh/en main engine on xiaoyou01 (TensorRT FP32, plugins/xiaoyou_tts — the
+    # top public system on this board) and the other languages on background
+    # cpu sub-engines: kokoro int8 for ja/es/fr, MMS Thai for th, Piper int8
+    # for de/ru. A sub that cannot be fetched degrades to the main per
+    # utterance, so readiness and the >=5-language admission rule never depend
+    # on it; if xiaoyou itself fails to build, kokoro becomes the main and all
+    # eight languages stay covered at kokoro quality. Rollback ladders:
+    #   engine: board-multi   (kokoro fp32-gpu main, same subs)
+    #   engine: kokoro-multi  (previous five-language baseline)
+    engine: board-xiaoyou
     backend: trt
     model_dir: /models/kokoro-multi
     # vits2-zh-en and mms-th support 0 only. For kokoro-multi this is an index
@@ -148,7 +151,7 @@ plugins:
     # CUDA provider falls back per node on quantised ops), so it carries its own
     # default in ENGINE_DEVICE_DEFAULTS — gpu. An explicit `cpu` here would apply
     # to every engine and quietly override that.
-    device: gpu  # Darvin TTS board: the board-multi/kokoro fp32 main engine on the Orin GPU (measured RTF ~0.07 on JP6); board sub-voices are cpu by construction
+    device: gpu  # Darvin TTS board: board-xiaoyou runs xiaoyou TRT on the Orin GPU and this device applies to the degraded kokoro main; board sub-voices are cpu by construction
     # Pronunciation language while no per-case value arrives. For board-multi
     # this is the session fallback for text the script probe cannot assign (and
     # the espeak voice for non-Chinese runs), one of en-us, en-gb, zh, ja, es,

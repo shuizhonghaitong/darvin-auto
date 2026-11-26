@@ -296,14 +296,18 @@ TOOLS = [
                 # without rebuilding the image. Mirrors asr_model in asr.py.
                 "tts_engine": {"type": "string",
                                "enum": ["vits2-zh-en", "matcha-zh-en", "mms-th",
-                                        "kokoro-multi", "board-multi"],
+                                        "kokoro-multi", "board-multi",
+                                        "board-xiaoyou"],
                                "description": "TTS engine, named <model>-<languages> to match "
                                               "asr_model (vits2-zh-en = VITS2 on TensorRT, "
                                               "matcha-zh-en = Matcha-icefall, "
                                               "mms-th = MMS Thai, "
                                               "kokoro-multi = Kokoro-82M v1.0, "
                                               "board-multi = eight-language board: kokoro "
-                                              "plus MMS Thai and Piper de/ru)",
+                                              "plus MMS Thai and Piper de/ru, "
+                                              "board-xiaoyou = eight-language board with "
+                                              "xiaoyou01 TensorRT as the zh/en main "
+                                              "engine)",
                                "default": "vits2-zh-en", "scope": "shared"},
                 # matcha-zh-en, mms-th and kokoro-multi only — vits2-zh-en is a
                 # TensorRT engine and never touches ONNX Runtime, so this field does
@@ -321,7 +325,8 @@ TOOLS = [
                                 "default": "cpu", "scope": "shared",
                                 "x-show-when": {"tts_engine": ["matcha-zh-en", "mms-th",
                                                                "kokoro-multi",
-                                                               "board-multi"]}},
+                                                               "board-multi",
+                                                               "board-xiaoyou"]}},
                 # Kokoro takes `lang` per generate() call, so this is a scale on the
                 # resident model like `speed` — not a session key.
                 #
@@ -350,7 +355,8 @@ TOOLS = [
                                    "kokoro; per-utterance detection applies while no "
                                    "value is set",
                     "default": "en-us", "scope": "shared",
-                    "x-show-when": {"tts_engine": ["kokoro-multi", "board-multi"]}},
+                    "x-show-when": {"tts_engine": ["kokoro-multi", "board-multi",
+                                                     "board-xiaoyou"]}},
                 # Thai has no spaces between words, and MMS was trained on text
                 # that spaced only phrase boundaries. Segmenting every word may
                 # help prosody or hurt it — off until it has been A/B'd on device.
@@ -1744,14 +1750,6 @@ class BoardMultiTTSAdapter(TTSAdapter):
     # Cyrillic -> Latin, GOST-ish romanisation. Only ever used as a
     # last-resort feed for the kokoro engine when a sub-engine is down: see
     # _sanitize_for_kokoro for why raw Cyrillic must never reach it.
-    _CYR_TO_LATIN = {
-        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
-        "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
-        "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
-        "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
-        "ъ": " ", "ы": "y", "ь": " ", "э": "e", "ю": "yu", "я": "ya",
-        "і": "i", "ї": "yi", "є": "ye", "ґ": "g",        # uk-ish variants
-    }
     _CRASH_SCRIPT_RE = re.compile("[\u0400-\u04ff\u0e00-\u0e7f]")
 
     def _sanitize_for_kokoro(self, text: str) -> str:
@@ -1795,6 +1793,14 @@ class BoardMultiTTSAdapter(TTSAdapter):
     # the host is slow enough that the kokoro baseline for that one
     # utterance is the honest answer.
     _SUB_WAIT_S = 10.0
+    _CYR_TO_LATIN = {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+        "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+        "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+        "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+        "ъ": " ", "ы": "y", "ь": " ", "э": "e", "ю": "yu", "я": "ya",
+        "і": "i", "ї": "yi", "є": "ye", "ґ": "g",        # uk-ish variants
+    }
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
                  device: str = "gpu", language: str = KokoroTTSAdapter.DEFAULT_LANGUAGE,
@@ -1993,6 +1999,404 @@ class BoardMultiTTSAdapter(TTSAdapter):
                 log.warning("[tts] closing a board sub-engine failed: %s", exc)
 
 
+# ── xiaoyou01 zh/en board composition ────────────────────────────────────────
+#
+# The board's eight-language composition with the zh/en main engine swapped
+# from kokoro to xiaoyou01 — the TensorRT FP32 runtime in plugins/xiaoyou_tts
+# (Apache-2.0, ported from lanxijiang/phanthymotus, the top public system on
+# this board). ja/es/fr stay on kokoro (int8 cpu sub), th on MMS, de/ru on
+# piper, with the same per-utterance degradation rules as BoardMultiTTSAdapter.
+#
+# xiaoyou is the *main* engine — built inline, gated by /ready — because zh
+# and en are half the board's cases and scoring is per-utterance GSB against
+# baseline audio: an utterance answered by a weaker engine is a real point
+# loss. The safety property is kept with one inline escape hatch: if the
+# bundle download, the frontend worker or the TRT load fails, kokoro becomes
+# the main instead and the board still speaks all eight languages (zh/en at
+# kokoro quality).
+#
+# Memory: the GPU carries exactly one neural TTS model per instance (xiaoyou
+# TRT); every sub-engine is int8/cpu, the same envelope the board measured.
+# xiaoyou's frontend is a subprocess (the /opt/xiaoyou-tts venv), so spacy and
+# misaki never touch the main interpreter. One ONNX Runtime per process is
+# preserved: xiaoyou is pure TensorRT through ctypes, and kokoro/mms/piper are
+# all sherpa sessions — the single-ORT arrangement board-multi documented.
+
+def _detect_board_language(text: str):
+    """Script/stopword probe, the same rules as KokoroTTSAdapter._detect_language.
+
+    Consulted only when no explicit session language is set. It reads class
+    tables, so it works before any adapter is built."""
+    if not text:
+        return None
+    if KokoroTTSAdapter._KANA_RE.search(text):
+        return "ja"
+    if KokoroTTSAdapter._CJK_RE.search(text):
+        return "zh"
+    if KokoroTTSAdapter._CYRILLIC_RE.search(text):
+        return "ru"
+    if KokoroTTSAdapter._THAI_RE.search(text):
+        return "th"
+    tokens = set(re.findall(r"[a-z\u00e0-\u00ff]+", text.lower()))
+    if len(tokens) < 2:
+        return None
+    scores = {lang: len(words & tokens)
+              for lang, words in KokoroTTSAdapter._LATIN_STOPWORDS.items()}
+    best = max(scores.values())
+    if best < 2:
+        return None
+    winners = [lang for lang, s in scores.items() if s == best]
+    return winners[0] if len(winners) == 1 else None
+
+
+class XiaoyouTTSAdapter(TTSAdapter):
+    """xiaoyou01 (01yuewen) zh/en on TensorRT FP32, streaming 16 kHz PCM.
+
+    The runtime downloads a pinned bundle (ModelScope, size + SHA256 verified
+    end to end), starts its frontend worker subprocess and loads the
+    prebuilt JP6 engine. iter_pcm yields pcm16 at 16 kHz — the backend
+    resamples its 24 kHz native output internally.
+    """
+
+    dry_run_text = "Hi."  # == TRTBackend.dry_run_text
+
+    def __init__(self, model_dir: str, speed: float = 1.0, on_status=None):
+        from plugins.xiaoyou_tts.runtime.model_bundle import (
+            resolve_runtime_manifest_pin)
+        from plugins.xiaoyou_tts.runtime.synthesis import acquire_gpu_backend
+
+        self._speed = speed
+        base = (model_dir or "/models/xiaoyou01").rstrip("/")
+        pin = resolve_runtime_manifest_pin(None)
+        status = (lambda text: None) if on_status is None else on_status
+
+        def _progress(pct: int, done: float, total: float):
+            status(f"downloading xiaoyou bundle {pct}%")
+
+        def _stage(stage: str):
+            status(f"xiaoyou {stage}")
+
+        self._lease = acquire_gpu_backend(
+            f"{base}/{pin[:12]}", cpu_threads=2,
+            progress_cb=_progress, stage_cb=_stage)
+
+    def synthesize(self, text: str) -> bytes:
+        return self._lease.synthesize(text, language="auto", speed=self._speed)
+
+    def synthesize_stream(self, text: str, language: str = "auto"):
+        yield from self._lease.iter_pcm(
+            text, language=language or "auto", speed=self._speed)
+
+    def warmup(self) -> int:
+        return self._lease.warmup()
+
+    def close(self) -> None:
+        self._lease.close()
+
+
+class XiaoyouBoardTTSAdapter(TTSAdapter):
+    """Eight-language board: xiaoyou zh/en main + kokoro/mms/piper cpu subs.
+
+    zh/en route to the main (xiaoyou when it built, kokoro in degraded
+    mode); ja/es/fr to the kokoro int8-cpu sub (or the kokoro main when
+    degraded); th to MMS; de/ru to piper int8. A failed or slow sub degrades
+    to the main per utterance — never to silence when the main can speak the
+    script.
+
+    BOARD_XIAOYOU_SUBS (comma list, default "ja_es_fr,th,de,ru") trims the
+    resident sub-engines for the three-instances-on-8 GB budget without a
+    code change; a trimmed kind degrades to the main per utterance.
+    """
+
+    dry_run_text = "ok"
+
+    # label -> route kind. main = zh/en (xiaoyou, or the degraded kokoro).
+    _LABELS = {
+        "zh": "main", "zh-cn": "main", "zh-tw": "main", "zh-hans": "main",
+        "chinese": "main", "cn": "main",
+        "en": "main", "en-us": "main", "en-gb": "main", "english": "main",
+        "ja": "ja_es_fr", "ja-jp": "ja_es_fr", "japanese": "ja_es_fr",
+        "es": "ja_es_fr", "es-es": "ja_es_fr", "es-mx": "ja_es_fr",
+        "spanish": "ja_es_fr",
+        "fr": "ja_es_fr", "fr-fr": "ja_es_fr", "french": "ja_es_fr",
+        "th": "th", "th-th": "th", "thai": "th",
+        "de": "de", "de-de": "de", "german": "de",
+        "ru": "ru", "ru-ru": "ru", "russian": "ru",
+    }
+
+    _SUB_MODELS = {
+        "ja_es_fr": ("kokoro-int8", "/models/kokoro-multi"),
+        "th": ("mms-th", "/models/mms-th"),
+        "de": ("piper-de", "/models/piper-de"),
+        "ru": ("piper-ru", "/models/piper-ru"),
+    }
+
+    _CRASH_SCRIPT_RE = re.compile("[\u0400-\u04ff\u0e00-\u0e7f]")
+    _DE_CHARS_RE = re.compile(r"[\u00df\u00e4\u00f6\u00fc\u00c4\u00d6\u00dc]")
+    _KANA_RE = re.compile("[\u3040-\u30ff]")
+    _SUB_WAIT_S = 10.0
+    _CYR_TO_LATIN = {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+        "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+        "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+        "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+        "ъ": " ", "ы": "y", "ь": " ", "э": "e", "ю": "yu", "я": "ya",
+        "і": "i", "ї": "yi", "є": "ye", "ґ": "g",        # uk-ish variants
+    }
+
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
+                 device: str = "gpu", language: str = "en-us",
+                 japanese_worker: bool = False,
+                 japanese_worker_device: str = "cpu", on_status=None):
+        import os
+
+        # xiaoyou main first — the whole point of the engine. One inline
+        # escape hatch: any failure (bundle, frontend worker, TRT load)
+        # demotes the board to the kokoro main, which still speaks all eight
+        # languages through its own voice set and the subs below.
+        self._degraded = False
+        xiaoyou_dir = os.environ.get("XIAOYOU_V6_MODEL_DIR", "/models/xiaoyou01")
+        try:
+            self._main = XiaoyouTTSAdapter(xiaoyou_dir, speed, on_status=on_status)
+        except Exception as exc:  # noqa: BLE001 - recorded, then escaped
+            self._degraded = True
+            log.error("[tts] board-xiaoyou: xiaoyou main failed to build; "
+                      "degrading to the kokoro main (zh/en at kokoro "
+                      "quality, all eight languages still covered): %s", exc)
+            self._main = KokoroTTSAdapter(
+                model_dir, speaker_id, speed, device,
+                language=language,
+                japanese_worker=False,
+                japanese_worker_device=japanese_worker_device,
+                japanese_via_sherpa=True,
+                on_status=on_status)
+
+        wanted = {k.strip() for k in os.environ.get(
+            "BOARD_XIAOYOU_SUBS", "ja_es_fr,th,de,ru").split(",") if k.strip()}
+        kinds = [k for k in ("ja_es_fr", "th", "de", "ru") if k in wanted]
+        if self._degraded:
+            # The kokoro main already owns ja/es/fr — a second kokoro would
+            # be a duplicate download and load.
+            kinds = [k for k in kinds if k != "ja_es_fr"]
+
+        self._explicit_language = ""
+        self._main_language = ""
+        self._speed = speed
+        self._sub_state = {
+            kind: {"state": "building", "adapter": None, "error": None}
+            for kind in kinds
+        }
+        if not kinds:
+            self._sub_state = {}
+        self._sub_lock = threading.Condition()
+        self._sub_synth_lock = threading.Lock()
+        for kind in kinds:
+            threading.Thread(target=self._load_sub, args=(kind,),
+                             name=f"tts-boardxy-{kind}", daemon=True).start()
+        log.info("[tts] board-xiaoyou: %s main up; sub-engines %s loading "
+                 "in the background",
+                 "DEGRADED kokoro" if self._degraded else "xiaoyou",
+                 ",".join(kinds) or "none")
+
+    # ── sub build ────────────────────────────────────────────────────────────
+    def _load_sub(self, kind: str) -> None:
+        name, sub_dir = self._SUB_MODELS[kind]
+        try:
+            if kind == "ja_es_fr":
+                # cpu by construction: the GPU is xiaoyou's. int8 weights,
+                # per-utterance language detection, Japanese inside the
+                # sherpa session — the single-ORT arrangement documented in
+                # BoardMultiTTSAdapter.
+                adapter = KokoroTTSAdapter(
+                    sub_dir, 0, self._speed, "cpu",
+                    language=KokoroTTSAdapter.DEFAULT_LANGUAGE,
+                    japanese_worker=False,
+                    japanese_worker_device="cpu",
+                    japanese_via_sherpa=True)
+            elif kind == "th":
+                adapter = MmsThaiTTSAdapter(sub_dir, 0, self._speed, "cpu")
+            else:
+                adapter = PiperVitsTTSAdapter(kind, sub_dir, self._speed, "cpu")
+        except Exception as exc:  # noqa: BLE001 - recorded, never propagated
+            with self._sub_lock:
+                self._sub_state[kind].update(state="error", error=str(exc))
+                self._sub_lock.notify_all()
+            log.warning("[tts] board-xiaoyou sub-engine %s (%s) failed to "
+                        "build; its languages degrade to the main per "
+                        "utterance: %s", kind, name, exc)
+            return
+        with self._sub_lock:
+            self._sub_state[kind].update(state="ready", adapter=adapter)
+            self._sub_lock.notify_all()
+        log.info("[tts] board-xiaoyou sub-engine %s (%s) ready", kind, name)
+
+    # ── routing ──────────────────────────────────────────────────────────────
+    def _detect_german_fallback(self, text: str):
+        if not text or not self._DE_CHARS_RE.search(text):
+            return None
+        tokens = set(re.findall(r"[a-z\u00e0-\u00ff]+", text.lower()))
+        if not tokens:
+            return None
+        de_hits = len(tokens & KokoroTTSAdapter._LATIN_STOPWORDS["de"])
+        if de_hits >= 1:
+            return "de"
+        if len(tokens) >= 3:
+            return "de"
+        return None
+
+    def _route(self, text: str) -> str:
+        if self._explicit_language:
+            label = self._explicit_language.strip().lower()
+        else:
+            label = _detect_board_language(text)
+            if label is None:
+                label = self._detect_german_fallback(text)
+        kind = self._LABELS.get(label or "", "main")
+        if kind == "ja_es_fr" and (self._degraded or "ja_es_fr" not in self._sub_state):
+            return "main"
+        return kind
+
+    def _sub_for(self, kind: str):
+        import time
+        deadline = time.monotonic() + self._SUB_WAIT_S
+        with self._sub_lock:
+            while True:
+                state = self._sub_state.get(kind)
+                if state is None or state["state"] != "building":
+                    return state["adapter"] if state else None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._sub_lock.wait(remaining)
+
+    def _sub_ready_now(self, kind: str):
+        with self._sub_lock:
+            state = self._sub_state.get(kind)
+            if state and state["state"] == "ready":
+                return state["adapter"]
+        return None
+
+    @staticmethod
+    def _romanise(text: str) -> str:
+        """Cyrillic -> Latin for a main-engine fallback (same table and the
+        same reason as board-multi: the words survive, the accent does not).
+        Thai and kana have no Latin shape here and are dropped."""
+        table = XiaoyouBoardTTSAdapter._CYR_TO_LATIN
+        kana = XiaoyouBoardTTSAdapter._KANA_RE
+        out = []
+        for ch in text:
+            low = ch.lower()
+            if ch in table or low in table:
+                out.append(table.get(ch) or table[low])
+            elif "\u0e00" <= ch <= "\u0e7f" or kana.match(ch):
+                out.append(" ")
+            else:
+                out.append(ch)
+        return re.sub(r"\s+", " ", "".join(out)).strip()
+    def _main_stream(self, text: str):
+        """Speak `text` on the main engine, with the script-safe retries.
+
+        Degraded mode: the main is kokoro, fed exactly as board-multi feeds
+        its main (crash scripts romanised or dropped, never raw). xiaoyou
+        mode: xiaoyou speaks zh/en natively; text it refuses (no zh/en-
+        speakable content — e.g. a th or ja case whose sub is down) is
+        retried romanised, and if even that is empty the case has no
+        speakable remainder and is logged as such."""
+        if self._degraded:
+            fallback = self._sanitize_crash_scripts(text)
+            if fallback:
+                yield from self._main.synthesize_stream(fallback)
+            else:
+                log.error("[tts] board-xiaoyou: degraded main has no "
+                          "speakable content for this text")
+            return
+        language = self._main_language or "auto"
+        try:
+            yield from self._main.synthesize_stream(text, language=language)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[tts] board-xiaoyou: xiaoyou rejected the text "
+                        "(%s); retrying romanised", exc)
+            retry = self._romanise(text)
+            if not retry or retry == text:
+                log.error("[tts] board-xiaoyou: no speakable remainder "
+                          "after romanisation")
+                return
+            yield from self._main.synthesize_stream(retry, language="auto")
+
+    @classmethod
+    def _sanitize_crash_scripts(cls, text: str) -> str:
+        if not cls._CRASH_SCRIPT_RE.search(text):
+            return text
+        return cls._romanise(text)
+
+    def synthesize(self, text: str) -> bytes:
+        return b''.join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        kind = self._route(text)
+        if kind == "main":
+            yield from self._main_stream(text)
+            return
+        adapter = self._sub_for(kind)
+        if adapter is None:
+            log.warning("[tts] board-xiaoyou: sub-engine %s not usable (%s); "
+                        "degrading to the main for this utterance",
+                        kind, self._sub_state.get(kind, {}).get("state"))
+            yield from self._main_stream(text)
+            return
+        with self._sub_synth_lock:
+            yield from adapter.synthesize_stream(text)
+
+    # ── session state ────────────────────────────────────────────────────────
+    def set_language(self, language: str) -> None:
+        label = (language or "").strip().lower()
+        self._explicit_language = language
+        kind = self._LABELS.get(label, "main")
+        if self._degraded:
+            # The kokoro main speaks main + ja/es_fr; board-multi's rule:
+            # never push th/de/ru labels at it.
+            if kind in ("main", "ja_es_fr"):
+                self._main.set_language(language)
+            return
+        if kind == "main":
+            self._main_language = label if label in ("zh", "en") else "auto"
+        else:
+            adapter = self._sub_ready_now(kind)
+            if adapter is not None and hasattr(adapter, "set_language"):
+                adapter.set_language(language)
+
+    def set_speed(self, speed: float) -> None:
+        self._speed = speed
+        if hasattr(self._main, "set_speed"):
+            self._main.set_speed(speed)
+        with self._sub_lock:
+            adapters = [s["adapter"] for s in self._sub_state.values()
+                        if s["state"] == "ready"]
+        for adapter in adapters:
+            adapter.set_speed(speed)
+
+    def warmup(self) -> int:
+        return self._main.warmup()
+
+    def close(self) -> None:
+        try:
+            self._main.close()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[tts] board-xiaoyou: closing the main failed: %s", exc)
+        with self._sub_lock:
+            adapters = [s["adapter"] for s in self._sub_state.values()
+                        if s["adapter"] is not None]
+        for adapter in adapters:
+            closer = getattr(adapter, "close", None)
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[tts] board-xiaoyou: closing a sub-engine "
+                            "failed: %s", exc)
+
+
 def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
     import os
     from utils.onnx_provider import normalize_device
@@ -2041,6 +2445,15 @@ def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
                       or KokoroTTSAdapter.DEFAULT_LANGUAGE),
             japanese_worker=bool(cfg.get('japanese_worker', True)),
             japanese_worker_device=str(cfg.get('japanese_worker_device') or 'gpu'),
+            on_status=on_status,
+        )
+    if engine == 'board-xiaoyou':
+        return XiaoyouBoardTTSAdapter(
+            model_dir, speaker_id, speed, device,
+            language=(cfg.get('tts_language') or cfg.get('language')
+                      or KokoroTTSAdapter.DEFAULT_LANGUAGE),
+            japanese_worker=False,
+            japanese_worker_device=str(cfg.get('japanese_worker_device') or 'cpu'),
             on_status=on_status,
         )
     return MatchaTTSAdapter(model_dir, speaker_id, speed, device,
@@ -2875,6 +3288,10 @@ ENGINE_MODEL_DIRS = {
     # BoardMultiTTSAdapter._SUB_MODELS, because they are part of the board
     # composition, not a selectable engine.
     "board-multi": "/models/kokoro-multi",
+    # The xiaoyou bundle lives in its own fixed tree (the adapter resolves the
+    # pin subdirectory); this directory serves the degraded-mode kokoro main
+    # and the ja/es/fr kokoro sub.
+    "board-xiaoyou": "/models/kokoro-multi",
 }
 # Where an engine wants to run when nothing has been configured. Only Kokoro
 # differs: it is a 310 MB fp32 graph on gpu and the CUDA provider is worth having,
@@ -2890,6 +3307,8 @@ ENGINE_DEVICE_DEFAULTS = {
     # Same reason as kokoro-multi: the main engine is that fp32 graph, and
     # the device field is about it. The sub-voices are cpu by construction.
     "board-multi": "gpu",
+    # Same: the configured device describes the *degraded* kokoro main.
+    "board-xiaoyou": "gpu",
 }
 # How long an `action=config` engine switch waits for the new engine before
 # answering `loading`. Sized so the bounded part of a build finishes inside it

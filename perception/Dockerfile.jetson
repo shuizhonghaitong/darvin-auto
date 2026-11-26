@@ -588,6 +588,47 @@ COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
 
+# ── Xiaoyou01 zh/en frontend (plugins/xiaoyou_tts, Apache-2.0) ───────────────
+# Ported from lanxijiang/phanthymotus (the top public system on this board):
+# the V6 TensorRT FP32 engine speaks through a native Python frontend (spacy +
+# misaki + number normalisation) that must run in its own pinned-ABI venv. The
+# venv is built here so the runtime only has to download the pinned model
+# bundle; the English model ships inside that bundle on JP6. The main engine
+# (TensorRT) needs nothing from this venv, so a failed or missing frontend only
+# costs the zh/en main — board-xiaoyou degrades to the kokoro main, and the
+# kokoro/mms/piper sub-engines are untouched.
+ARG ENABLE_XIAOYOU_TTS=1
+RUN if [ "${ENABLE_XIAOYOU_TTS}" = "1" ]; then \
+      set -eu; \
+      case "${JP_VERSION}" in \
+        511) \
+          python3 -m venv --without-pip --system-site-packages /opt/xiaoyou-tts; \
+          /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+            --no-cache-dir -i "${PYPI_MIRROR}" \
+            -r /work/plugins/xiaoyou_tts/requirements.jp511.txt; \
+          echo '[build] Xiaoyou JP5 frontend: fetching pinned English model'; \
+          stage="$(mktemp -d)"; \
+          trap 'rm -rf -- "$stage"' EXIT; \
+          cd /work && python3 -B -c 'import sys; from pathlib import Path; from plugins.xiaoyou_tts.runtime.model_bundle import _download; _download(sys.argv[1], Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4])' \
+            'https://www.modelscope.cn/api/v1/models/lanxijiang/xiaoyou01/repo?Revision=a80e6533662438aa7d7301658e05ddb95b1c1717&FilePath=xiaoyou-jp511-en-core-web-sm-3.7.1.tar.gz' \
+            "$stage/english-model.tar.gz" 12801025 5abc483a9204f80cd21590a484cb7e98fe44b91e9341085476d973e80734310f; \
+          site_dir="$(/opt/xiaoyou-tts/bin/python3 -IB -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"; \
+          tar -xzf "$stage/english-model.tar.gz" --no-same-owner --no-same-permissions -C "$site_dir"; \
+          echo '[build] Xiaoyou JP5 frontend: checking Python 3.8 and native imports'; \
+          /opt/xiaoyou-tts/bin/python3 -IB -c 'import sys; from importlib.metadata import version; from pathlib import Path; sys.modules["torch"] = None; import en_core_web_sm, numpy, pypinyin_dict, regex, spacy; from misaki import en, espeak, zh; assert sys.version_info[:2] == (3, 8); assert numpy.__version__ == "1.24.4" and spacy.__version__ == "3.7.5" and version("misaki") == "0.9.4" and version("en-core-web-sm") == "3.7.1"; assert Path(sys.prefix) in Path(en_core_web_sm.__file__).resolve().parents'; \
+          ;; \
+        61) \
+          python3 -m venv --without-pip --system-site-packages /opt/xiaoyou-tts; \
+          /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+            --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" pip==26.3; \
+          /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+            --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" \
+            -r /work/plugins/xiaoyou_tts/requirements.jetson.txt; \
+          echo '[build] Xiaoyou JP6 frontend: venv ready at /opt/xiaoyou-tts'; \
+          ;; \
+      esac; \
+    fi
+
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually
 # ships, and asserts the one invariant the Thai engine depends on: every character
